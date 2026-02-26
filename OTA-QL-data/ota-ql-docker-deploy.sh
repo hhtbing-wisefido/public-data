@@ -185,9 +185,7 @@ pull_latest_image() {
 }
 
 # 端口冲突检测
-# 参数: $1 = 绑定地址
 check_port_conflicts() {
-    local BIND_ADDR="${1:-127.0.0.1}"
     local CONFLICT=false
     local PORTS=("${TCP_PORT}" "${HTTP_PORT}" "${API_PORT}" "${HTTPS_PORT}" "${MQTT_PORT}")
     local NAMES=("TCP调度" "HTTP固件" "Web管理" "HTTPS认证" "MQTT")
@@ -242,11 +240,28 @@ check_port_conflicts() {
 }
 
 # 启动新容器
-# 参数: $1 = 绑定地址 (127.0.0.1 或 0.0.0.0)
+# 参数: $1 = 部署模式 (production 或 test)
+# 生产模式: TCP/MQTT 绑定 0.0.0.0 (设备直连), 其余绑定 127.0.0.1 (反代)
+# 测试模式: 全部绑定 0.0.0.0
 start_new_container() {
-    local BIND_ADDR="${1:-127.0.0.1}"
+    local MODE="${1:-production}"
     log_info "启动新容器..."
-    log_info "端口绑定模式: ${BIND_ADDR}"
+
+    if [ "$MODE" = "test" ]; then
+        log_info "端口绑定模式: 0.0.0.0 (全部暴露)"
+        local TCP_BIND="0.0.0.0"
+        local HTTP_BIND="0.0.0.0"
+        local API_BIND="0.0.0.0"
+        local HTTPS_BIND="0.0.0.0"
+        local MQTT_BIND="0.0.0.0"
+    else
+        log_info "端口绑定模式: 混合 (TCP/MQTT=0.0.0.0, Web/HTTP/HTTPS=127.0.0.1)"
+        local TCP_BIND="0.0.0.0"     # 设备直连，必须暴露
+        local HTTP_BIND="127.0.0.1"  # 固件下载走反代
+        local API_BIND="127.0.0.1"   # Web管理走反代
+        local HTTPS_BIND="0.0.0.0"   # V3设备TLS直连，必须暴露
+        local MQTT_BIND="0.0.0.0"    # V3设备MQTT直连，必须暴露
+    fi
 
     local ENV_ARGS=""
     if [ -n "${SERVER_ADDR}" ]; then
@@ -256,11 +271,11 @@ start_new_container() {
     docker run -d \
         --name ${CONTAINER_NAME} \
         --restart unless-stopped \
-        -p ${BIND_ADDR}:${TCP_PORT}:1060 \
-        -p ${BIND_ADDR}:${HTTP_PORT}:8688 \
-        -p ${BIND_ADDR}:${API_PORT}:8690 \
-        -p ${BIND_ADDR}:${HTTPS_PORT}:8443 \
-        -p ${BIND_ADDR}:${MQTT_PORT}:1883 \
+        -p ${TCP_BIND}:${TCP_PORT}:1060 \
+        -p ${HTTP_BIND}:${HTTP_PORT}:8688 \
+        -p ${API_BIND}:${API_PORT}:8690 \
+        -p ${HTTPS_BIND}:${HTTPS_PORT}:8443 \
+        -p ${MQTT_BIND}:${MQTT_PORT}:1883 \
         -v ${FIRMWARE_DIR}:/app/firmware \
         -v ${APP_DATA_DIR}:/app/data \
         -v ${CERTS_DIR}:/app/certs \
@@ -480,10 +495,8 @@ get_public_ip() {
 
 deploy_container() {
     local mode="${1:-production}"
-    local bind_addr="127.0.0.1"
 
     if [ "$mode" = "test" ]; then
-        bind_addr="0.0.0.0"
         echo ""
         echo -e "${BG_RED}${BOLD}  ⚠️  测试环境部署模式  ${NC}"
         echo ""
@@ -499,8 +512,8 @@ deploy_container() {
         echo ""
         echo -e "${BG_GREEN}${BOLD}  🔒 生产环境部署模式  ${NC}"
         echo ""
-        log_info "端口将绑定到 127.0.0.1，仅本机可访问"
-        log_info "推荐通过反向代理(Nginx/Caddy)对外提供服务"
+        log_info "混合端口绑定: TCP/HTTPS/MQTT=0.0.0.0(设备直连), Web/HTTP=127.0.0.1(反代)"
+        log_info "推荐通过反向代理(Nginx/Caddy)对外提供 Web 管理和固件下载"
         echo ""
     fi
 
@@ -516,7 +529,7 @@ deploy_container() {
 
     create_data_directories
 
-    if ! check_port_conflicts "$bind_addr"; then
+    if ! check_port_conflicts; then
         return 1
     fi
 
@@ -527,7 +540,7 @@ deploy_container() {
         return 1
     fi
 
-    start_new_container "$bind_addr"
+    start_new_container "$mode"
     save_deploy_mode "$mode"
 
     if health_check; then
@@ -564,12 +577,12 @@ show_production_deploy_success() {
     echo "  数据: ${DATA_DIR}"
     echo ""
 
-    echo "[服务端口] (绑定 127.0.0.1 — 仅本机)"
-    echo "  TCP调度:    ${TCP_PORT}  — V2设备连接"
-    echo "  HTTP固件:   ${HTTP_PORT}  — Range下载"
-    echo "  Web管理:    ${API_PORT}  — 管理面板/API"
-    echo "  HTTPS认证:  ${HTTPS_PORT}   — V3设备认证"
-    echo "  MQTT:       ${MQTT_PORT}  — V3 MQTT Broker"
+    echo "[服务端口] (混合绑定 — 安全模式)"
+    echo "  TCP调度:    ${TCP_PORT}  — 0.0.0.0 (设备直连)"
+    echo "  HTTP固件:   ${HTTP_PORT}  — 127.0.0.1 (反代)"
+    echo "  Web管理:    ${API_PORT}  — 127.0.0.1 (反代)"
+    echo "  HTTPS认证:  ${HTTPS_PORT}   — 0.0.0.0 (设备TLS直连)"
+    echo "  MQTT:       ${MQTT_PORT}  — 0.0.0.0 (设备直连)"
     echo ""
 
     echo "[访问地址]"
@@ -585,8 +598,9 @@ show_production_deploy_success() {
     echo ""
 
     echo -e "${BG_GREEN}${BOLD}  安全说明  ${NC}"
-    echo -e "  ${GREEN}✓${NC} 所有端口仅绑定本机 (127.0.0.1)"
-    echo -e "  ${GREEN}✓${NC} 建议通过 Nginx/Caddy 反向代理提供公网访问"
+    echo -e "  ${GREEN}✓${NC} TCP/HTTPS/MQTT 绑定 0.0.0.0 (设备必须直连)"
+    echo -e "  ${GREEN}✓${NC} Web管理/HTTP固件 绑定 127.0.0.1 (仅反代可访问)"
+    echo -e "  ${GREEN}✓${NC} 建议通过 Nginx/Caddy 反向代理 Web 和固件服务"
     echo -e "  ${GREEN}✓${NC} 推荐启用 HTTPS (Let's Encrypt 免费证书)"
     echo ""
 }
