@@ -15,7 +15,7 @@
 #   TCP  1060 — V2 TCP调度/注册（设备直连）
 #   HTTP 8688 — 固件下载（Range/206）
 #   API  8690 — Web管理面板/RESTful API
-#   HTTPS 443 — V3 HTTPS认证
+#   HTTPS 8443 — V3 HTTPS认证
 #   MQTT 1883 — V3 MQTT Broker
 ###############################################################################
 
@@ -52,7 +52,7 @@ BACKUP_LIST_FILE="${BACKUP_BASE_DIR}/.backup_list"
 TCP_PORT="1060"          # V2 TCP调度/注册
 HTTP_PORT="8688"         # HTTP固件下载
 API_PORT="8690"          # Web管理面板/API
-HTTPS_PORT="443"         # V3 HTTPS认证
+HTTPS_PORT="8443"         # V3 HTTPS认证
 MQTT_PORT="1883"         # V3 MQTT Broker
 
 # 环境变量覆盖
@@ -224,8 +224,8 @@ check_port_conflicts() {
         echo ""
         echo "解决方案:"
         echo "  1. 停止占用端口的服务: sudo systemctl stop <服务名>"
-        echo "  2. 查看占用详情: sudo ss -tlnp | grep -E '443|1060|8688|8690|1883'"
-        echo "  3. 如果 443 被 nginx/apache 占用:"
+        echo "  2. 查看占用详情: sudo ss -tlnp | grep -E '8443|1060|8688|8690|1883'"
+        echo "  3. 如果 8443 被其他服务占用:"
         echo "     sudo systemctl stop nginx   # 或 apache2"
         echo "  4. 或修改本脚本中的端口变量后重试"
         echo ""
@@ -259,7 +259,7 @@ start_new_container() {
         -p ${BIND_ADDR}:${TCP_PORT}:1060 \
         -p ${BIND_ADDR}:${HTTP_PORT}:8688 \
         -p ${BIND_ADDR}:${API_PORT}:8690 \
-        -p ${BIND_ADDR}:${HTTPS_PORT}:443 \
+        -p ${BIND_ADDR}:${HTTPS_PORT}:8443 \
         -p ${BIND_ADDR}:${MQTT_PORT}:1883 \
         -v ${FIRMWARE_DIR}:/app/firmware \
         -v ${APP_DATA_DIR}:/app/data \

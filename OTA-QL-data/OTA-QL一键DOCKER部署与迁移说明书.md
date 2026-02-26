@@ -27,7 +27,7 @@
 OTA-QL 是清澜雷达（ESP32-S3）固件 OTA 远程升级管理服务，支持：
 
 - 🔌 **V2 协议** — TCP + Protobuf 长连接（端口 1060）
-- 📡 **V3 协议** — HTTPS 认证 + MQTT 3.1.1（端口 443/1883）
+- 📡 **V3 协议** — HTTPS 认证 + MQTT 3.1.1（端口 8443/1883）
 - 🖥️ **Web 管理面板** — 设备管理、固件管理、OTA 推送、实时日志（端口 8690）
 - 📦 **HTTP 固件服务** — Range 断点续传下载（端口 8688）
 
@@ -38,7 +38,7 @@ OTA-QL 是清澜雷达（ESP32-S3）固件 OTA 远程升级管理服务，支持
 | TCP 调度 | 1060 | TCP | V2 设备连接 |
 | HTTP 固件 | 8688 | HTTP | 固件 Range 下载 |
 | Web 管理 | 8690 | HTTP | 管理面板 + API |
-| HTTPS 认证 | 443 | HTTPS | V3 设备认证 |
+| HTTPS 认证 | 8443 | HTTPS | V3 设备认证 |
 | MQTT | 1883 | MQTT | V3 消息通信 |
 
 ### 1.3 Docker 镜像
@@ -59,7 +59,7 @@ ghcr.io/hhtbing-wisefido/ota-ql:latest
 | Docker | 20.10+ |
 | 内存 | ≥ 512MB |
 | 磁盘 | ≥ 1GB 可用空间 |
-| 网络 | 需要开放 1060/8688/8690/443/1883 端口 |
+| 网络 | 需要开放 1060/8688/8690/8443/1883 端口 |
 
 ### 2.2 一键部署（推荐）
 
@@ -323,7 +323,7 @@ sudo ./ota-ql-docker-deploy.sh
 
 | 问题 | 原因 | 解决方案 |
 |------|------|----------|
-| 容器无法启动 | 端口被占用 | `netstat -tlnp \| grep -E "1060\|8688\|8690\|443\|1883"` |
+| 容器无法启动 | 端口被占用 | `netstat -tlnp \| grep -E "1060\|8688\|8690\|8443\|1883"` |
 | 健康检查失败 | 服务未完全启动 | 等待30秒后重试 |
 | 忘记初始密码 | 未记录 | 使用菜单 9 重置密码 |
 | 设备无法连接 | 防火墙未放行 | 检查 iptables/ufw 规则 |
@@ -425,7 +425,7 @@ services:
       - "1060:1060"
       - "8688:8688"
       - "8690:8690"
-      - "443:443"
+      - "8443:8443"
       - "1883:1883"
     volumes:
       - ./ota-data/firmware:/app/firmware
@@ -443,14 +443,14 @@ services:
 sudo ufw allow 1060/tcp
 sudo ufw allow 8688/tcp
 sudo ufw allow 8690/tcp
-sudo ufw allow 443/tcp
+sudo ufw allow 8443/tcp
 sudo ufw allow 1883/tcp
 
 # firewalld（CentOS）
 sudo firewall-cmd --permanent --add-port=1060/tcp
 sudo firewall-cmd --permanent --add-port=8688/tcp
 sudo firewall-cmd --permanent --add-port=8690/tcp
-sudo firewall-cmd --permanent --add-port=443/tcp
+sudo firewall-cmd --permanent --add-port=8443/tcp
 sudo firewall-cmd --permanent --add-port=1883/tcp
 sudo firewall-cmd --reload
 ```
