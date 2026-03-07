@@ -11,12 +11,12 @@
 # 一键部署（推荐）:
 #   wget -O ota-ql-docker-deploy.sh "https://raw.githubusercontent.com/hhtbing-wisefido/public-data/main/OTA-QL-data/ota-ql-docker-deploy.sh" && chmod +x ota-ql-docker-deploy.sh && sudo ./ota-ql-docker-deploy.sh
 #
-# 服务端口:
-#   TCP  1060 — V2 TCP调度/注册（设备直连）
-#   HTTP 8688 — 固件下载（Range/206）
-#   API  8690 — Web管理面板/RESTful API
-#   HTTPS 8443 — V3 HTTPS认证
-#   MQTT 1883 — V3 MQTT Broker
+# 服务端口（v4.4 五端口架构）:
+#   HTTPS 10088 — Web管理面板 + API + 固件下载（统一HTTPS）
+#   HTTP  10089 — ESP32 OTA明文固件下载
+#   GW    10086 — cmux设备网关（TCP+TLS自动识别）
+#   MQTT   1883 — MQTT Broker（明文）
+#   MQTTS  8883 — MQTT Broker（TLS加密）
 ###############################################################################
 
 # ============================================================================
@@ -48,12 +48,12 @@ DEPLOY_MODE_FILE="${DATA_DIR}/.deploy_mode"
 BACKUP_BASE_DIR="/backup/ota-ql"
 BACKUP_LIST_FILE="${BACKUP_BASE_DIR}/.backup_list"
 
-# 服务端口
-TCP_PORT="1060"          # V2 TCP调度/注册
-HTTP_PORT="8688"         # HTTP固件下载
-API_PORT="8690"          # Web管理面板/API
-HTTPS_PORT="8443"         # V3 HTTPS认证
-MQTT_PORT="1883"         # V3 MQTT Broker
+# 服务端口（v4.4 五端口架构）
+HTTPS_PORT="10088"       # Web管理面板 + API + 固件下载（统一HTTPS）
+HTTP_FW_PORT="10089"     # v4.4: ESP32 OTA明文固件下载
+GW_PORT="10086"          # cmux设备网关（TCP+TLS自动识别）
+MQTT_PORT="1883"         # MQTT Broker（明文）
+MQTTS_PORT="8883"        # MQTT Broker（TLS加密）
 
 # 环境变量覆盖
 SERVER_ADDR="${OTA_SERVER_ADDR:-}"
@@ -188,8 +188,8 @@ pull_latest_image() {
 check_port_conflicts() {
     local SELF_CONFLICT=false
     local EXT_CONFLICT=false
-    local PORTS=("${TCP_PORT}" "${HTTP_PORT}" "${API_PORT}" "${HTTPS_PORT}" "${MQTT_PORT}")
-    local NAMES=("TCP调度" "HTTP固件" "Web管理" "HTTPS认证" "MQTT")
+    local PORTS=("${HTTPS_PORT}" "${HTTP_FW_PORT}" "${GW_PORT}" "${MQTT_PORT}" "${MQTTS_PORT}")
+    local NAMES=("HTTPS统一" "HTTP固件" "cmux网关" "MQTT" "MQTTS")
 
     log_info "检查端口占用..."
     for i in "${!PORTS[@]}"; do
@@ -248,7 +248,7 @@ check_port_conflicts() {
         echo ""
         echo "解决方案:"
         echo "  1. 停止占用端口的服务: sudo systemctl stop <服务名>"
-        echo "  2. 查看占用详情: sudo ss -tlnp | grep -E '8443|1060|8688|8690|1883'"
+        echo "  2. 查看占用详情: sudo ss -tlnp | grep -E '10088|10089|10086|1883|8883'"
         echo "  3. 或修改本脚本中的端口变量后重试"
         echo ""
         read -p "是否强制继续部署？(可能失败) [y/N]: " FORCE
@@ -265,7 +265,7 @@ check_port_conflicts() {
 
 # 启动新容器
 # 参数: $1 = 部署模式 (production 或 test)
-# 生产模式: TCP/MQTT 绑定 0.0.0.0 (设备直连), 其余绑定 127.0.0.1 (反代)
+# 生产模式: 设备网关/MQTT 绑定 0.0.0.0 (设备直连), HTTPS管理 绑定 127.0.0.1 (反代)
 # 测试模式: 全部绑定 0.0.0.0
 start_new_container() {
     local MODE="${1:-production}"
@@ -273,18 +273,16 @@ start_new_container() {
 
     if [ "$MODE" = "test" ]; then
         log_info "端口绑定模式: 0.0.0.0 (全部暴露)"
-        local TCP_BIND="0.0.0.0"
-        local HTTP_BIND="0.0.0.0"
-        local API_BIND="0.0.0.0"
         local HTTPS_BIND="0.0.0.0"
+        local GW_BIND="0.0.0.0"
         local MQTT_BIND="0.0.0.0"
+        local MQTTS_BIND="0.0.0.0"
     else
-        log_info "端口绑定模式: 混合 (TCP/MQTT=0.0.0.0, Web/HTTP/HTTPS=127.0.0.1)"
-        local TCP_BIND="0.0.0.0"     # 设备直连，必须暴露
-        local HTTP_BIND="127.0.0.1"  # 固件下载走反代
-        local API_BIND="127.0.0.1"   # Web管理走反代
-        local HTTPS_BIND="0.0.0.0"   # V3设备TLS直连，必须暴露
-        local MQTT_BIND="0.0.0.0"    # V3设备MQTT直连，必须暴露
+        log_info "端口绑定模式: 混合 (GW/MQTT/MQTTS=0.0.0.0, HTTPS管理=127.0.0.1)"
+        local HTTPS_BIND="127.0.0.1"  # Web管理/API/固件走反代
+        local GW_BIND="0.0.0.0"       # cmux设备网关，设备直连必须暴露
+        local MQTT_BIND="0.0.0.0"     # MQTT设备直连，必须暴露
+        local MQTTS_BIND="0.0.0.0"    # MQTTS设备直连，必须暴露
     fi
 
     local ENV_ARGS=""
@@ -295,17 +293,17 @@ start_new_container() {
     docker run -d \
         --name ${CONTAINER_NAME} \
         --restart unless-stopped \
-        -p ${TCP_BIND}:${TCP_PORT}:1060 \
-        -p ${HTTP_BIND}:${HTTP_PORT}:8688 \
-        -p ${API_BIND}:${API_PORT}:8690 \
-        -p ${HTTPS_BIND}:${HTTPS_PORT}:8443 \
+        -p ${HTTPS_BIND}:${HTTPS_PORT}:10088 \
+        -p ${HTTP_FW_BIND}:${HTTP_FW_PORT}:10089 \
+        -p ${GW_BIND}:${GW_PORT}:10086 \
         -p ${MQTT_BIND}:${MQTT_PORT}:1883 \
+        -p ${MQTTS_BIND}:${MQTTS_PORT}:8883 \
         -v ${FIRMWARE_DIR}:/app/firmware \
         -v ${APP_DATA_DIR}:/app/data \
         -v ${CERTS_DIR}:/app/certs \
         -v ${LOGS_DIR}:/app/logs \
         ${ENV_ARGS} \
-        --health-cmd="wget -q --spider http://localhost:8690/api/health || exit 1" \
+        --health-cmd="wget -q --no-check-certificate --spider https://localhost:10088/api/health || exit 1" \
         --health-interval=30s \
         --health-timeout=5s \
         --health-retries=3 \
@@ -324,11 +322,11 @@ health_check() {
     log_info "等待服务启动..."
     sleep 3
 
-    log_info "执行健康检查（API + 端口）..."
+    log_info "执行健康检查（HTTPS API + 设备网关）..."
     local MAX_RETRIES=20
     local RETRY_COUNT=0
     local API_OK=false
-    local TCP_OK=false
+    local GW_OK=false
 
     while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
         # 检查容器是否还在运行
@@ -338,25 +336,25 @@ health_check() {
             return 1
         fi
 
-        # 检查 API 端点
+        # 检查 HTTPS API 端点
         if ! $API_OK; then
-            if curl -sf http://localhost:${API_PORT}/api/health > /dev/null 2>&1; then
+            if curl -skf https://localhost:${HTTPS_PORT}/api/health > /dev/null 2>&1; then
                 API_OK=true
             fi
         fi
 
-        # 检查 TCP 端口
-        if ! $TCP_OK; then
-            if (echo > /dev/tcp/localhost/${TCP_PORT}) 2>/dev/null; then
-                TCP_OK=true
+        # 检查 cmux 设备网关端口
+        if ! $GW_OK; then
+            if (echo > /dev/tcp/localhost/${GW_PORT}) 2>/dev/null; then
+                GW_OK=true
             fi
         fi
 
         # 两个都通过则成功
-        if $API_OK && $TCP_OK; then
+        if $API_OK && $GW_OK; then
             echo ""
-            echo -e "  ${GREEN}✓${NC} API端点 (${API_PORT})  — 正常"
-            echo -e "  ${GREEN}✓${NC} TCP端口 (${TCP_PORT})  — 正常"
+            echo -e "  ${GREEN}✓${NC} HTTPS API (${HTTPS_PORT})  — 正常"
+            echo -e "  ${GREEN}✓${NC} 设备网关  (${GW_PORT})  — 正常"
             echo ""
             log_success "健康检查全部通过 ✓"
             return 0
@@ -369,14 +367,14 @@ health_check() {
 
     echo ""
     if $API_OK; then
-        echo -e "  ${GREEN}✓${NC} API端点 (${API_PORT})  — 正常"
+        echo -e "  ${GREEN}✓${NC} HTTPS API (${HTTPS_PORT})  — 正常"
     else
-        echo -e "  ${RED}✗${NC} API端点 (${API_PORT})  — 失败"
+        echo -e "  ${RED}✗${NC} HTTPS API (${HTTPS_PORT})  — 失败"
     fi
-    if $TCP_OK; then
-        echo -e "  ${GREEN}✓${NC} TCP端口 (${TCP_PORT})  — 正常"
+    if $GW_OK; then
+        echo -e "  ${GREEN}✓${NC} 设备网关  (${GW_PORT})  — 正常"
     else
-        echo -e "  ${RED}✗${NC} TCP端口 (${TCP_PORT})  — 失败"
+        echo -e "  ${RED}✗${NC} 设备网关  (${GW_PORT})  — 失败"
     fi
     echo ""
     log_error "健康检查超时（部分服务未通过）"
@@ -448,7 +446,7 @@ show_initial_password() {
         echo -e "│  ${RED}⚠️  请立即记录此密码！此后不再显示${NC}      │"
         echo -e "│  ${YELLOW}⚠️  首次登录Web管理面板后请立即修改密码${NC} │"
         echo "├────────────────────────────────────────────┤"
-        echo -e "│  ${GREEN}管理面板: http://localhost:${API_PORT}/${NC}      │"
+        echo -e "│  ${GREEN}管理面板: https://localhost:${HTTPS_PORT}/${NC}      │"
         echo "└────────────────────────────────────────────┘"
         echo ""
         echo -e "${RED}🔴 安全提示: 如忘记密码，请使用菜单 [4. 重置管理员密码]${NC}"
@@ -525,7 +523,7 @@ deploy_container() {
         echo -e "${BG_RED}${BOLD}  ⚠️  测试环境部署模式  ${NC}"
         echo ""
         log_warning "此模式将所有端口暴露到所有网络接口（含公网！）"
-        log_warning "TCP(${TCP_PORT}) HTTP(${HTTP_PORT}) API(${API_PORT}) HTTPS(${HTTPS_PORT}) MQTT(${MQTT_PORT})"
+        log_warning "HTTPS(${HTTPS_PORT}) GW(${GW_PORT}) MQTT(${MQTT_PORT}) MQTTS(${MQTTS_PORT})"
         echo ""
         read -p "确认继续? [y/N]: " confirm
         if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
@@ -536,7 +534,7 @@ deploy_container() {
         echo ""
         echo -e "${BG_GREEN}${BOLD}  🔒 生产环境部署模式  ${NC}"
         echo ""
-        log_info "混合端口绑定: TCP/HTTPS/MQTT=0.0.0.0(设备直连), Web/HTTP=127.0.0.1(反代)"
+        log_info "混合端口绑定: GW/MQTT/MQTTS=0.0.0.0(设备直连), HTTPS管理=127.0.0.1(反代)"
         log_info "推荐通过反向代理(Nginx/Caddy)对外提供 Web 管理和固件下载"
         echo ""
     fi
@@ -602,18 +600,17 @@ show_production_deploy_success() {
     echo ""
 
     echo "[服务端口] (混合绑定 — 安全模式)"
-    echo "  TCP调度:    ${TCP_PORT}  — 0.0.0.0 (设备直连)"
-    echo "  HTTP固件:   ${HTTP_PORT}  — 127.0.0.1 (反代)"
-    echo "  Web管理:    ${API_PORT}  — 127.0.0.1 (反代)"
-    echo "  HTTPS认证:  ${HTTPS_PORT}   — 0.0.0.0 (设备TLS直连)"
+    echo "  HTTPS统一:  ${HTTPS_PORT}  — 127.0.0.1 (Web管理+API+固件,走反代)"
+    echo "  cmux网关:   ${GW_PORT}  — 0.0.0.0 (TCP+TLS设备直连)"
     echo "  MQTT:       ${MQTT_PORT}  — 0.0.0.0 (设备直连)"
+    echo "  MQTTS:      ${MQTTS_PORT}  — 0.0.0.0 (设备TLS直连)"
     echo ""
 
     echo "[访问地址]"
-    echo -e "  ${GREEN}✓${NC} 管理面板:  http://localhost:${API_PORT}/"
-    echo -e "  ${GREEN}✓${NC} 健康检查:  http://localhost:${API_PORT}/api/health"
+    echo -e "  ${GREEN}✓${NC} 管理面板:  https://localhost:${HTTPS_PORT}/"
+    echo -e "  ${GREEN}✓${NC} 健康检查:  https://localhost:${HTTPS_PORT}/api/health"
     if [ -n "$PUBLIC_IP" ]; then
-        echo -e "  ${RED}✗${NC} 公网访问:  http://${PUBLIC_IP}:${API_PORT}/ ${GREEN}(不可访问-安全)${NC}"
+        echo -e "  ${RED}✗${NC} 公网访问:  https://${PUBLIC_IP}:${HTTPS_PORT}/ ${GREEN}(不可访问-安全)${NC}"
     fi
     echo ""
 
@@ -622,10 +619,10 @@ show_production_deploy_success() {
     echo ""
 
     echo -e "${BG_GREEN}${BOLD}  安全说明  ${NC}"
-    echo -e "  ${GREEN}✓${NC} TCP/HTTPS/MQTT 绑定 0.0.0.0 (设备必须直连)"
-    echo -e "  ${GREEN}✓${NC} Web管理/HTTP固件 绑定 127.0.0.1 (仅反代可访问)"
-    echo -e "  ${GREEN}✓${NC} 建议通过 Nginx/Caddy 反向代理 Web 和固件服务"
-    echo -e "  ${GREEN}✓${NC} 推荐启用 HTTPS (Let's Encrypt 免费证书)"
+    echo -e "  ${GREEN}✓${NC} cmux网关/MQTT/MQTTS 绑定 0.0.0.0 (设备必须直连)"
+    echo -e "  ${GREEN}✓${NC} HTTPS管理+固件 绑定 127.0.0.1 (仅反代可访问)"
+    echo -e "  ${GREEN}✓${NC} 建议通过 Nginx/Caddy 反向代理 Web 管理和固件下载"
+    echo -e "  ${GREEN}✓${NC} 内置自签名证书，生产环境推荐 Let's Encrypt"
     echo ""
 }
 
@@ -644,17 +641,16 @@ show_test_deploy_success() {
     echo ""
 
     echo "[服务端口] (绑定 0.0.0.0 — 全部暴露!)"
-    echo -e "  TCP调度:    ${TCP_PORT}  — ${RED}公网可访问${NC}"
-    echo -e "  HTTP固件:   ${HTTP_PORT}  — ${RED}公网可访问${NC}"
-    echo -e "  Web管理:    ${API_PORT}  — ${RED}公网可访问${NC}"
-    echo -e "  HTTPS认证:  ${HTTPS_PORT}   — ${RED}公网可访问${NC}"
+    echo -e "  HTTPS统一:  ${HTTPS_PORT}  — ${RED}公网可访问${NC}"
+    echo -e "  cmux网关:   ${GW_PORT}  — ${RED}公网可访问${NC}"
     echo -e "  MQTT:       ${MQTT_PORT}  — ${RED}公网可访问${NC}"
+    echo -e "  MQTTS:      ${MQTTS_PORT}  — ${RED}公网可访问${NC}"
     echo ""
 
     echo "[访问地址]"
-    echo -e "  ${GREEN}✓${NC} 管理面板:  http://localhost:${API_PORT}/"
+    echo -e "  ${GREEN}✓${NC} 管理面板:  https://localhost:${HTTPS_PORT}/"
     if [ -n "$PUBLIC_IP" ]; then
-        echo -e "  ${GREEN}✓${NC} 公网管理:  http://${PUBLIC_IP}:${API_PORT}/ ${RED}(公网可访问!)${NC}"
+        echo -e "  ${GREEN}✓${NC} 公网管理:  https://${PUBLIC_IP}:${HTTPS_PORT}/ ${RED}(公网可访问!)${NC}"
     fi
     echo ""
 
@@ -809,7 +805,7 @@ reset_admin_password() {
         echo -e "│  ${YELLOW}⚠️  登录后请立即修改密码！${NC}              │"
         echo "└────────────────────────────────────────────┘"
         echo ""
-        log_highlight "管理面板: http://localhost:${API_PORT}/"
+        log_highlight "管理面板: https://localhost:${HTTPS_PORT}/"
         echo ""
     else
         log_error "无法获取新密码"
@@ -1015,7 +1011,7 @@ restore_data() {
 
         echo ""
         echo "后续操作:"
-        echo "  1. 验证管理面板: http://localhost:${API_PORT}/"
+        echo "  1. 验证管理面板: https://localhost:${HTTPS_PORT}/"
         echo "  2. 检查固件文件: ls -la ${FIRMWARE_DIR}/"
         if [ -d "${CURRENT_BACKUP}" ]; then
             echo "  3. 如需回滚: sudo rm -rf ${DATA_DIR} && sudo mv ${CURRENT_BACKUP} ${DATA_DIR} && docker restart ${CONTAINER_NAME}"
@@ -1217,13 +1213,13 @@ show_deployment_info() {
     echo ""
 
     echo "[访问地址]"
-    echo -e "  ${GREEN}✓${NC} 管理面板:  http://localhost:${API_PORT}/"
-    echo -e "  ${GREEN}✓${NC} 健康检查:  http://localhost:${API_PORT}/api/health"
+    echo -e "  ${GREEN}✓${NC} 管理面板:  https://localhost:${HTTPS_PORT}/"
+    echo -e "  ${GREEN}✓${NC} 健康检查:  https://localhost:${HTTPS_PORT}/api/health"
     if [ -n "$PUBLIC_IP" ]; then
         if [ "$deploy_mode" = "test" ]; then
-            echo -e "  ${GREEN}✓${NC} 公网管理:  http://${PUBLIC_IP}:${API_PORT}/ ${RED}(可访问)${NC}"
+            echo -e "  ${GREEN}✓${NC} 公网管理:  https://${PUBLIC_IP}:${HTTPS_PORT}/ ${RED}(可访问)${NC}"
         else
-            echo -e "  ${RED}✗${NC} 公网管理:  http://${PUBLIC_IP}:${API_PORT}/ ${GREEN}(不可访问)${NC}"
+            echo -e "  ${RED}✗${NC} 公网管理:  https://${PUBLIC_IP}:${HTTPS_PORT}/ ${GREEN}(不可访问)${NC}"
         fi
     fi
     echo ""
@@ -1243,7 +1239,7 @@ interactive_menu() {
     while true; do
         echo ""
         echo "=========================================="
-        echo "  OTA-QL 管理工具 (v3.0)"
+        echo "  OTA-QL 管理工具 (v4.4)"
         echo "=========================================="
         echo ""
         echo -e "  ${GREEN}1.${NC}  一键部署 ${GREEN}(生产环境-安全)${NC}"
@@ -1337,8 +1333,8 @@ main() {
     echo ""
     echo "=========================================="
     echo "  OTA-QL Docker 部署管理工具"
-    echo "  版本: v3.0 | 清澜雷达 OTA 升级系统"
-    echo "  服务: TCP/HTTP/API/HTTPS/MQTT (5端口)"
+    echo "  版本: v4.4 | 清澜雷达 OTA 升级系统"
+    echo "  服务: HTTPS/GW/MQTT/MQTTS (4端口)"
     echo "=========================================="
     echo ""
 

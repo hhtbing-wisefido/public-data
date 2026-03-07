@@ -26,20 +26,20 @@
 
 OTA-QL 是清澜雷达（ESP32-S3）固件 OTA 远程升级管理服务，支持：
 
-- 🔌 **TCP（Protobuf）长连接** — 端口 1060
-- 📡 **MQTT 3.1.1（HTTPS 认证）** — 端口 8443/1883
-- 🖥️ **Web 管理面板** — 设备管理、固件管理、OTA 推送、实时日志（端口 8690）
-- 📦 **HTTP 固件服务** — Range 断点续传下载（端口 8688）
+- 🔌 **cmux 设备网关** — 端口 10086（TCP+TLS 自动识别，设备直连）
+- 📡 **MQTT 3.1.1 Broker** — 端口 1883（明文）/ 8883（TLS）
+- 🖥️ **HTTPS 统一服务** — Web 管理面板 + API（端口 10088）
+- 📦 **HTTP 固件服务** — ESP32 OTA 明文固件下载（端口 10089）
 
 ### 1.2 服务端口
 
 | 服务 | 端口 | 协议 | 说明 |
 |------|------|------|------|
-| TCP 调度 | 1060 | TCP | TCP 设备连接（Protobuf） |
-| HTTP 固件 | 8688 | HTTP | 固件 Range 下载 |
-| Web 管理 | 8690 | HTTP | 管理面板 + API |
-| HTTPS 认证 | 8443 | HTTPS | 设备认证 |
-| MQTT | 1883 | MQTT | 消息通信 |
+| HTTPS 统一 | 10088 | HTTPS | Web 管理 + API |
+| HTTP 固件 | 10089 | HTTP | ESP32 OTA 明文固件下载 |
+| cmux 网关 | 10086 | TCP/TLS | 设备连接（自动识别协议） |
+| MQTT | 1883 | MQTT | 消息通信（明文） |
+| MQTTS | 8883 | MQTTS | 消息通信（TLS 加密） |
 
 ### 1.3 Docker 镜像
 
@@ -59,7 +59,7 @@ ghcr.io/hhtbing-wisefido/ota-ql:latest
 | Docker | 20.10+ |
 | 内存 | ≥ 512MB |
 | 磁盘 | ≥ 1GB 可用空间 |
-| 网络 | 需要开放 1060/8688/8690/8443/1883 端口 |
+| 网络 | 需要开放 10088/10089/10086/1883/8883 端口 |
 
 ### 2.2 一键部署（推荐）
 
@@ -87,8 +87,8 @@ wget -O ota-ql-docker-deploy.sh "https://raw.githubusercontent.com/hhtbing-wisef
 2. ✅ 拉取最新镜像
 3. ✅ 选择部署环境（生产 / 测试）
 4. ✅ 创建数据卷目录
-5. ✅ 启动容器（5端口映射）
-6. ✅ 执行健康检查（API + TCP 双重检测）
+5. ✅ 启动容器（4端口映射）
+6. ✅ 执行健康检查（HTTPS API + 设备网关 双重检测）
 7. ✅ 显示管理员初始密码
 
 ### 3.2 环境选择
@@ -103,7 +103,7 @@ wget -O ota-ql-docker-deploy.sh "https://raw.githubusercontent.com/hhtbing-wisef
 部署成功后，脚本会显示：
 
 ```
-🔐 管理面板地址: http://<服务器IP>:8690
+🔐 管理面板地址: https://<服务器IP>:10088
 🔑 初始密码: <随机生成>
 ```
 
@@ -117,7 +117,7 @@ wget -O ota-ql-docker-deploy.sh "https://raw.githubusercontent.com/hhtbing-wisef
 
 ```
 ====================================
-  OTA-QL Docker 管理工具 v3.0
+  OTA-QL Docker 管理工具 v4.4
 ====================================
  1. 部署/更新服务
  2. 检查存储卷
@@ -156,8 +156,8 @@ wget -O ota-ql-docker-deploy.sh "https://raw.githubusercontent.com/hhtbing-wisef
 ### 4.4 健康检查（菜单 5）
 
 双重检测机制：
-- **API 检测**: `curl http://localhost:8690/api/health`
-- **TCP 检测**: 检测 1060 端口是否可连接
+- **HTTPS API 检测**: `curl -sk https://localhost:10088/api/health`
+- **设备网关检测**: 检测 10086 端口是否可连接
 
 ### 4.5 备份数据（菜单 6）
 
@@ -323,7 +323,7 @@ sudo ./ota-ql-docker-deploy.sh
 
 | 问题 | 原因 | 解决方案 |
 |------|------|----------|
-| 容器无法启动 | 端口被占用 | `netstat -tlnp \| grep -E "1060\|8688\|8690\|8443\|1883"` |
+| 容器无法启动 | 端口被占用 | `netstat -tlnp \| grep -E "10088\|10089\|10086\|1883\|8883"` |
 | 健康检查失败 | 服务未完全启动 | 等待30秒后重试 |
 | 忘记初始密码 | 未记录 | 使用菜单 9 重置密码 |
 | 设备无法连接 | 防火墙未放行 | 检查 iptables/ufw 规则 |
@@ -355,7 +355,7 @@ docker ps -a --filter name=ota-ql
 docker stats ota-ql --no-stream
 
 # API 健康检查
-curl -s http://localhost:8690/api/health | python3 -m json.tool
+curl -sk https://localhost:10088/api/health | python3 -m json.tool
 ```
 
 ### 8.4 数据卷检查
@@ -422,11 +422,10 @@ services:
     container_name: ota-ql
     restart: unless-stopped
     ports:
-      - "1060:1060"
-      - "8688:8688"
-      - "8690:8690"
-      - "8443:8443"
+      - "10088:10088"
+      - "10086:10086"
       - "1883:1883"
+      - "8883:8883"
     volumes:
       - ./ota-data/firmware:/app/firmware
       - ./ota-data/certs:/app/certs
@@ -440,18 +439,16 @@ services:
 
 ```bash
 # UFW（Ubuntu）
-sudo ufw allow 1060/tcp
-sudo ufw allow 8688/tcp
-sudo ufw allow 8690/tcp
-sudo ufw allow 8443/tcp
+sudo ufw allow 10088/tcp
+sudo ufw allow 10086/tcp
 sudo ufw allow 1883/tcp
+sudo ufw allow 8883/tcp
 
 # firewalld（CentOS）
-sudo firewall-cmd --permanent --add-port=1060/tcp
-sudo firewall-cmd --permanent --add-port=8688/tcp
-sudo firewall-cmd --permanent --add-port=8690/tcp
-sudo firewall-cmd --permanent --add-port=8443/tcp
+sudo firewall-cmd --permanent --add-port=10088/tcp
+sudo firewall-cmd --permanent --add-port=10086/tcp
 sudo firewall-cmd --permanent --add-port=1883/tcp
+sudo firewall-cmd --permanent --add-port=8883/tcp
 sudo firewall-cmd --reload
 ```
 
@@ -462,4 +459,4 @@ sudo firewall-cmd --reload
 
 ---
 
-> ⚡ **版本历史**: v3.0 (2026-02-28) — 初始版本，基于 owl-website 部署文档模板
+> ⚡ **版本历史**: v4.4 (2026-03-05) — 五端口架构（HTTPS:10088 + HTTP固件:10089 + cmux:10086 + MQTT:1883 + MQTTS:8883）
