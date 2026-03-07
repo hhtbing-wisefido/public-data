@@ -3,10 +3,10 @@
 ###############################################################################
 # OTA-QL Docker 自动部署与管理脚本
 # 文件名: ota-ql-docker-deploy.sh
-# 用途: 首次部署、滚动更新、备份恢复、密码重置、存储卷检查、日志管理
+# 用途: 首次部署、滚动更新、备份恢复、密码重置、存储卷检查、日志管理、SSL证书管理
 # 作者: WiseFido Technologies
-# 版本: v4.6
-# 更新: 2026-03-08
+# 版本: v5.0
+# 更新: 2026-03-09
 #
 # 一键部署（推荐）:
 #   wget -O ota-ql-docker-deploy.sh "https://raw.githubusercontent.com/hhtbing-wisefido/public-data/main/OTA-QL-data/ota-ql-docker-deploy.sh" && chmod +x ota-ql-docker-deploy.sh && sudo ./ota-ql-docker-deploy.sh
@@ -59,6 +59,31 @@ MQTTS_PORT="8883"        # MQTT Broker（TLS加密）
 # 环境变量覆盖（OTA_SERVER_ADDR 优先级最高，其次是下面的默认值，留空则自动检测本机IP）
 SERVER_ADDR="${OTA_SERVER_ADDR:-}"
 LOG_LEVEL="${OTA_LOG_LEVEL:-info}"
+
+# ============================================================================
+# SSL 证书搜索路径数据库（支持多种面板和发行版）
+# ============================================================================
+# 格式: "面板名称|证书路径模板|私钥路径模板"
+# <DOMAIN> 占位符将被替换为实际域名
+CERT_SEARCH_PATHS=(
+    "宝塔面板(BaoTa)|/www/server/panel/vhost/cert/<DOMAIN>/fullchain.pem|/www/server/panel/vhost/cert/<DOMAIN>/privkey.pem"
+    "宝塔面板(SSL)|/www/server/panel/vhost/ssl/<DOMAIN>/fullchain.pem|/www/server/panel/vhost/ssl/<DOMAIN>/privkey.pem"
+    "1Panel|/opt/1panel/core/apps/openresty/openresty/www/sites/<DOMAIN>/ssl/fullchain.pem|/opt/1panel/core/apps/openresty/openresty/www/sites/<DOMAIN>/ssl/privkey.pem"
+    "1Panel(Nginx)|/opt/1panel/core/apps/nginx/nginx/www/sites/<DOMAIN>/ssl/fullchain.pem|/opt/1panel/core/apps/nginx/nginx/www/sites/<DOMAIN>/ssl/privkey.pem"
+    "aaPanel|/www/server/panel/vhost/cert/<DOMAIN>/fullchain.pem|/www/server/panel/vhost/cert/<DOMAIN>/privkey.pem"
+    "Let's Encrypt(Certbot)|/etc/letsencrypt/live/<DOMAIN>/fullchain.pem|/etc/letsencrypt/live/<DOMAIN>/privkey.pem"
+    "acme.sh|/root/.acme.sh/<DOMAIN>/fullchain.cer|/root/.acme.sh/<DOMAIN>/<DOMAIN>.key"
+    "acme.sh(ECC)|/root/.acme.sh/<DOMAIN>_ecc/fullchain.cer|/root/.acme.sh/<DOMAIN>_ecc/<DOMAIN>.key"
+    "CyberPanel|/etc/letsencrypt/live/<DOMAIN>/fullchain.pem|/etc/letsencrypt/live/<DOMAIN>/privkey.pem"
+    "AppNode|/usr/local/appnode/nginx/conf/ssl/<DOMAIN>/fullchain.pem|/usr/local/appnode/nginx/conf/ssl/<DOMAIN>/privkey.pem"
+    "Nginx默认|/etc/nginx/ssl/<DOMAIN>/fullchain.pem|/etc/nginx/ssl/<DOMAIN>/privkey.pem"
+    "Nginx(conf.d)|/etc/nginx/conf.d/ssl/<DOMAIN>/fullchain.pem|/etc/nginx/conf.d/ssl/<DOMAIN>/privkey.pem"
+    "Apache(Debian)|/etc/apache2/ssl/<DOMAIN>/fullchain.pem|/etc/apache2/ssl/<DOMAIN>/privkey.pem"
+    "Apache(RHEL)|/etc/httpd/ssl/<DOMAIN>/fullchain.pem|/etc/httpd/ssl/<DOMAIN>/privkey.pem"
+    "Caddy|/var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory/<DOMAIN>/<DOMAIN>.crt|/var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory/<DOMAIN>/<DOMAIN>.key"
+    "cPanel|/var/cpanel/ssl/installed/certs/<DOMAIN>.crt|/var/cpanel/ssl/installed/keys/<DOMAIN>.key"
+    "Plesk|/usr/local/psa/var/certificates/<DOMAIN>/fullchain.pem|/usr/local/psa/var/certificates/<DOMAIN>/privkey.pem"
+)
 
 # ============================================================================
 # 日志函数
@@ -291,9 +316,10 @@ start_new_container() {
         ENV_ARGS="-e OTA_SERVER_ADDR=${SERVER_ADDR}"
     fi
 
-    # v8.3 P2: 自动检测并加载TLS证书（解决ESP32 esp-x509-crt-bundle验证自签名证书失败）
+    # v5.0: 自动检测并加载TLS证书（解决ESP32 esp-x509-crt-bundle验证自签名证书失败）
     # 证书用于: cmux设备网关(10086) + MQTTS(8883) + HTTPS(10088) 的TLS握手
     # 宝塔Nginx的证书只管浏览器访问，设备直连端口需要Go服务器自己的证书
+    # 证书由 deploy_container() → auto_detect_and_deploy_certs() 自动搜索部署
     local TLS_ENV_ARGS=""
     local CERT_FILE="${CERTS_DIR}/fullchain.pem"
     local KEY_FILE="${CERTS_DIR}/privkey.pem"
@@ -305,10 +331,7 @@ start_new_container() {
         log_warning "未检测到TLS证书文件: ${CERT_FILE}"
         log_warning "Go服务器将使用自签名证书（ESP32设备可能无法通过证书验证）"
         echo ""
-        echo -e "  ${YELLOW}如需ESP32设备正常连接，请复制宝塔SSL证书:${NC}"
-        echo -e "  ${CYAN}cp /www/server/panel/vhost/cert/<域名>/fullchain.pem ${CERTS_DIR}/${NC}"
-        echo -e "  ${CYAN}cp /www/server/panel/vhost/cert/<域名>/privkey.pem ${CERTS_DIR}/${NC}"
-        echo -e "  ${YELLOW}然后重启容器: sudo ./ota-ql-docker-deploy.sh${NC}"
+        echo -e "  ${YELLOW}如需ESP32设备正常连接，请使用菜单 [11. SSL证书管理] 配置证书${NC}"
         echo ""
     fi
 
@@ -689,6 +712,758 @@ menu_set_callback_addr() {
     esac
 }
 
+# ============================================================================
+# SSL 证书自动搜索与管理（v5.0 新增）
+# ============================================================================
+
+# 从回调地址或用户输入提取域名列表
+# 返回: 空格分隔的域名列表（排除IP地址）
+get_domains_for_cert() {
+    local domains=()
+
+    # 优先从回调地址文件读取
+    local cb_addr=$(get_callback_addr)
+    if [ -n "$cb_addr" ]; then
+        # 排除纯IP地址，只取域名
+        if ! echo "$cb_addr" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+            domains+=("$cb_addr")
+        fi
+    fi
+
+    echo "${domains[*]}"
+}
+
+# 搜索指定域名的SSL证书
+# 参数: $1 = 域名
+# 返回: 找到的证书路径列表（存入全局数组 FOUND_CERTS）
+# FOUND_CERTS 格式: "面板名称|证书路径|私钥路径"
+search_certs_for_domain() {
+    local domain="$1"
+    FOUND_CERTS=()
+
+    if [ -z "$domain" ]; then
+        return 1
+    fi
+
+    log_info "搜索域名 ${domain} 的SSL证书..."
+    echo ""
+
+    local found_count=0
+    for entry in "${CERT_SEARCH_PATHS[@]}"; do
+        local panel_name=$(echo "$entry" | cut -d'|' -f1)
+        local cert_template=$(echo "$entry" | cut -d'|' -f2)
+        local key_template=$(echo "$entry" | cut -d'|' -f3)
+
+        # 替换 <DOMAIN> 占位符
+        local cert_path="${cert_template//<DOMAIN>/$domain}"
+        local key_path="${key_template//<DOMAIN>/$domain}"
+
+        if [ -f "$cert_path" ] && [ -f "$key_path" ]; then
+            found_count=$((found_count + 1))
+            FOUND_CERTS+=("${panel_name}|${cert_path}|${key_path}")
+
+            # 获取证书信息
+            local cert_expiry=""
+            local cert_cn=""
+            local cert_sans=""
+            if command -v openssl &> /dev/null; then
+                cert_expiry=$(openssl x509 -in "$cert_path" -noout -enddate 2>/dev/null | sed 's/notAfter=//')
+                cert_cn=$(openssl x509 -in "$cert_path" -noout -subject 2>/dev/null | sed 's/.*CN\s*=\s*//' | cut -d'/' -f1)
+                cert_sans=$(openssl x509 -in "$cert_path" -noout -text 2>/dev/null | grep -A1 "Subject Alternative Name" | tail -1 | sed 's/DNS://g; s/,//g; s/^\s*//')
+            fi
+
+            echo -e "  ${GREEN}✓${NC} [${found_count}] ${panel_name}"
+            echo -e "      证书: ${cert_path}"
+            echo -e "      私钥: ${key_path}"
+            if [ -n "$cert_cn" ]; then
+                echo -e "      域名: ${cert_cn}"
+            fi
+            if [ -n "$cert_sans" ]; then
+                echo -e "      SAN:  ${cert_sans}"
+            fi
+            if [ -n "$cert_expiry" ]; then
+                # 检查是否即将过期（30天内）
+                local expiry_epoch=$(date -d "$cert_expiry" +%s 2>/dev/null || echo "0")
+                local now_epoch=$(date +%s)
+                local days_left=$(( (expiry_epoch - now_epoch) / 86400 ))
+                if [ "$days_left" -lt 0 ]; then
+                    echo -e "      过期: ${RED}已过期!${NC}"
+                elif [ "$days_left" -lt 30 ]; then
+                    echo -e "      过期: ${YELLOW}${cert_expiry} (仅剩${days_left}天!)${NC}"
+                else
+                    echo -e "      过期: ${GREEN}${cert_expiry} (${days_left}天)${NC}"
+                fi
+            fi
+            echo ""
+        fi
+    done
+
+    # 额外: 通配符搜索常见目录（兜底）
+    local extra_dirs=(
+        "/www/server/panel/vhost/cert"
+        "/www/server/panel/vhost/ssl"
+        "/etc/letsencrypt/live"
+        "/root/.acme.sh"
+        "/etc/nginx/ssl"
+        "/opt/1panel"
+    )
+    for search_dir in "${extra_dirs[@]}"; do
+        if [ -d "$search_dir" ]; then
+            # 搜索包含域名的证书文件
+            local extra_certs=$(find "$search_dir" -name "fullchain.pem" -o -name "fullchain.cer" -o -name "*.crt" 2>/dev/null | grep -i "$domain" 2>/dev/null)
+            for extra_cert in $extra_certs; do
+                # 检查是否已在 FOUND_CERTS 中
+                local already_found=false
+                for existing in "${FOUND_CERTS[@]}"; do
+                    if echo "$existing" | grep -q "$extra_cert"; then
+                        already_found=true
+                        break
+                    fi
+                done
+                if [ "$already_found" = "false" ]; then
+                    local extra_dir=$(dirname "$extra_cert")
+                    local extra_key=""
+                    # 尝试找配对私钥
+                    for key_name in "privkey.pem" "*.key" "${domain}.key"; do
+                        local possible_key=$(find "$extra_dir" -name "$key_name" 2>/dev/null | head -1)
+                        if [ -n "$possible_key" ] && [ -f "$possible_key" ]; then
+                            extra_key="$possible_key"
+                            break
+                        fi
+                    done
+                    if [ -n "$extra_key" ]; then
+                        found_count=$((found_count + 1))
+                        FOUND_CERTS+=("发现于${search_dir}|${extra_cert}|${extra_key}")
+                        echo -e "  ${GREEN}✓${NC} [${found_count}] 额外发现 (${search_dir})"
+                        echo -e "      证书: ${extra_cert}"
+                        echo -e "      私钥: ${extra_key}"
+                        echo ""
+                    fi
+                fi
+            done
+        fi
+    done
+
+    if [ $found_count -eq 0 ]; then
+        echo -e "  ${RED}✗${NC} 未找到域名 ${domain} 的证书"
+        echo ""
+        return 1
+    fi
+
+    log_success "共找到 ${found_count} 个证书"
+    return 0
+}
+
+# 部署证书到 OTA-QL 的 certs 目录
+# 参数: $1 = 源证书路径, $2 = 源私钥路径, $3 = 面板名称（可选，用于日志）
+deploy_cert_to_ota() {
+    local src_cert="$1"
+    local src_key="$2"
+    local panel_name="${3:-未知来源}"
+
+    local dest_cert="${CERTS_DIR}/fullchain.pem"
+    local dest_key="${CERTS_DIR}/privkey.pem"
+
+    # 验证源文件
+    if [ ! -f "$src_cert" ]; then
+        log_error "证书文件不存在: $src_cert"
+        return 1
+    fi
+    if [ ! -f "$src_key" ]; then
+        log_error "私钥文件不存在: $src_key"
+        return 1
+    fi
+
+    # 验证证书和私钥匹配
+    if command -v openssl &> /dev/null; then
+        local cert_md5=$(openssl x509 -in "$src_cert" -noout -modulus 2>/dev/null | openssl md5 2>/dev/null)
+        local key_md5=$(openssl rsa -in "$src_key" -noout -modulus 2>/dev/null | openssl md5 2>/dev/null)
+        if [ -n "$cert_md5" ] && [ -n "$key_md5" ] && [ "$cert_md5" != "$key_md5" ]; then
+            log_error "证书和私钥不匹配！"
+            echo "  证书modulus MD5: $cert_md5"
+            echo "  私钥modulus MD5: $key_md5"
+            return 1
+        fi
+        log_success "证书和私钥验证匹配"
+    fi
+
+    # 备份已有证书
+    if [ -f "$dest_cert" ]; then
+        local backup_suffix=$(date +%Y%m%d_%H%M%S)
+        cp "$dest_cert" "${dest_cert}.backup.${backup_suffix}"
+        cp "$dest_key" "${dest_key}.backup.${backup_suffix}"
+        log_info "已备份原证书"
+    fi
+
+    # 创建目录
+    sudo mkdir -p "${CERTS_DIR}"
+
+    # 复制证书
+    sudo cp "$src_cert" "$dest_cert"
+    sudo cp "$src_key" "$dest_key"
+    sudo chmod 644 "$dest_cert"
+    sudo chmod 600 "$dest_key"
+
+    log_success "证书已部署到 ${CERTS_DIR}/"
+    echo -e "  来源:     ${panel_name}"
+    echo -e "  证书文件: ${dest_cert}"
+    echo -e "  私钥文件: ${dest_key}"
+
+    # 显示证书信息
+    if command -v openssl &> /dev/null; then
+        local cert_subject=$(openssl x509 -in "$dest_cert" -noout -subject 2>/dev/null | sed 's/subject=//')
+        local cert_expiry=$(openssl x509 -in "$dest_cert" -noout -enddate 2>/dev/null | sed 's/notAfter=//')
+        local cert_sans=$(openssl x509 -in "$dest_cert" -noout -text 2>/dev/null | grep -A1 "Subject Alternative Name" | tail -1 | sed 's/DNS://g; s/,//g; s/^\s*//')
+        echo -e "  主体:     ${cert_subject}"
+        echo -e "  SAN:      ${cert_sans}"
+        echo -e "  到期:     ${cert_expiry}"
+    fi
+    echo ""
+
+    return 0
+}
+
+# 部署时自动搜索并安装证书
+# 在 deploy_container() 中调用
+# 参数: 无（自动从回调地址提取域名）
+auto_detect_and_deploy_certs() {
+    echo ""
+    echo "=========================================="
+    echo "  SSL 证书自动检测"
+    echo "=========================================="
+    echo ""
+
+    # 检查是否已有证书
+    if [ -f "${CERTS_DIR}/fullchain.pem" ] && [ -f "${CERTS_DIR}/privkey.pem" ]; then
+        log_success "已有证书文件: ${CERTS_DIR}/"
+
+        # 显示已有证书信息
+        if command -v openssl &> /dev/null; then
+            local existing_cn=$(openssl x509 -in "${CERTS_DIR}/fullchain.pem" -noout -subject 2>/dev/null | sed 's/.*CN\s*=\s*//' | cut -d'/' -f1)
+            local existing_expiry=$(openssl x509 -in "${CERTS_DIR}/fullchain.pem" -noout -enddate 2>/dev/null | sed 's/notAfter=//')
+            local existing_sans=$(openssl x509 -in "${CERTS_DIR}/fullchain.pem" -noout -text 2>/dev/null | grep -A1 "Subject Alternative Name" | tail -1 | sed 's/DNS://g; s/,//g; s/^\s*//')
+            echo -e "  域名: ${existing_cn}"
+            echo -e "  SAN:  ${existing_sans}"
+            echo -e "  到期: ${existing_expiry}"
+        fi
+        echo ""
+
+        read -p "是否重新搜索并替换证书? [y/N]: " replace_confirm
+        if [[ ! "$replace_confirm" =~ ^[Yy]$ ]]; then
+            log_info "保留现有证书"
+            return 0
+        fi
+    fi
+
+    # 提取域名
+    local domains=$(get_domains_for_cert)
+    if [ -z "$domains" ]; then
+        log_warning "未检测到域名（回调地址为IP或未设置）"
+        echo ""
+        echo "  SSL证书需要域名才能搜索"
+        echo "  如需手动配置，请使用菜单中的 [证书管理] 功能"
+        echo ""
+        read -p "是否手动输入域名? [y/N]: " manual_confirm
+        if [[ "$manual_confirm" =~ ^[Yy]$ ]]; then
+            read -p "请输入域名 (多个用空格分隔): " manual_domains
+            domains="$manual_domains"
+        fi
+        if [ -z "$domains" ]; then
+            log_info "跳过证书配置（将使用自签名证书）"
+            return 0
+        fi
+    fi
+
+    log_info "搜索域名: ${domains}"
+    echo ""
+
+    # 对每个域名搜索
+    local all_found=()
+    for domain in $domains; do
+        search_certs_for_domain "$domain"
+        if [ ${#FOUND_CERTS[@]} -gt 0 ]; then
+            for cert_entry in "${FOUND_CERTS[@]}"; do
+                all_found+=("${domain}|${cert_entry}")
+            done
+        fi
+    done
+
+    if [ ${#all_found[@]} -eq 0 ]; then
+        echo ""
+        log_warning "未找到任何SSL证书"
+        echo ""
+        echo "  可能原因:"
+        echo "  1. 尚未为此域名申请SSL证书"
+        echo "  2. 证书存放在非标准路径"
+        echo "  3. 证书文件名不是标准格式"
+        echo ""
+        echo "  解决方案:"
+        echo -e "  ${CYAN}方案A:${NC} 在面板(宝塔/1Panel等)中为域名申请Let's Encrypt证书"
+        echo -e "  ${CYAN}方案B:${NC} 手动复制证书文件到 ${CERTS_DIR}/"
+        echo -e "         cp /path/to/fullchain.pem ${CERTS_DIR}/fullchain.pem"
+        echo -e "         cp /path/to/privkey.pem ${CERTS_DIR}/privkey.pem"
+        echo -e "  ${CYAN}方案C:${NC} 部署后使用菜单中的 [证书管理] 功能手动指定路径"
+        echo ""
+        echo -e "  ${YELLOW}提示: 没有CA证书时，Go服务器将使用自签名证书${NC}"
+        echo -e "  ${YELLOW}      ESP32设备可能无法通过TLS证书验证${NC}"
+        echo ""
+        read -p "按Enter键继续部署..." dummy
+        return 0
+    fi
+
+    # 只找到一个，直接使用
+    if [ ${#all_found[@]} -eq 1 ]; then
+        local entry="${all_found[0]}"
+        local cert_domain=$(echo "$entry" | cut -d'|' -f1)
+        local panel_name=$(echo "$entry" | cut -d'|' -f2)
+        local cert_path=$(echo "$entry" | cut -d'|' -f3)
+        local key_path=$(echo "$entry" | cut -d'|' -f4)
+
+        echo ""
+        read -p "是否使用此证书? [Y/n]: " use_confirm
+        if [[ "$use_confirm" =~ ^[Nn]$ ]]; then
+            log_info "跳过证书部署"
+            return 0
+        fi
+
+        deploy_cert_to_ota "$cert_path" "$key_path" "$panel_name"
+        return $?
+    fi
+
+    # 找到多个，让用户选择
+    echo ""
+    echo "找到多个证书，请选择:"
+    echo ""
+    local idx=0
+    for entry in "${all_found[@]}"; do
+        idx=$((idx + 1))
+        local cert_domain=$(echo "$entry" | cut -d'|' -f1)
+        local panel_name=$(echo "$entry" | cut -d'|' -f2)
+        local cert_path=$(echo "$entry" | cut -d'|' -f3)
+        echo "  [${idx}] ${panel_name} — 域名: ${cert_domain}"
+        echo "       ${cert_path}"
+    done
+    echo "  [0] 跳过，不部署证书"
+    echo ""
+    read -p "请选择 [0-${idx}]: " cert_choice
+
+    if [ "$cert_choice" = "0" ] || [ -z "$cert_choice" ]; then
+        log_info "跳过证书部署"
+        return 0
+    fi
+
+    if [ "$cert_choice" -ge 1 ] 2>/dev/null && [ "$cert_choice" -le $idx ] 2>/dev/null; then
+        local selected="${all_found[$((cert_choice-1))]}"
+        local sel_domain=$(echo "$selected" | cut -d'|' -f1)
+        local sel_panel=$(echo "$selected" | cut -d'|' -f2)
+        local sel_cert=$(echo "$selected" | cut -d'|' -f3)
+        local sel_key=$(echo "$selected" | cut -d'|' -f4)
+
+        deploy_cert_to_ota "$sel_cert" "$sel_key" "$sel_panel"
+        return $?
+    else
+        log_warning "无效选择，跳过证书部署"
+        return 0
+    fi
+}
+
+# 查看当前已部署的证书信息
+show_deployed_cert_info() {
+    echo ""
+    echo "=========================================="
+    echo "  当前SSL证书状态"
+    echo "=========================================="
+    echo ""
+
+    local cert_file="${CERTS_DIR}/fullchain.pem"
+    local key_file="${CERTS_DIR}/privkey.pem"
+
+    if [ ! -f "$cert_file" ]; then
+        echo -e "  ${RED}✗${NC} 未部署证书"
+        echo -e "  ${YELLOW}Go服务器正在使用自签名证书${NC}"
+        echo ""
+        echo "  ESP32设备连接可能遇到:"
+        echo "  • esp-x509-crt-bundle: Failed to verify certificate"
+        echo ""
+        echo "  请通过 [证书管理 → 搜索并部署] 配置CA签名证书"
+        echo ""
+        return 1
+    fi
+
+    echo -e "  ${GREEN}✓${NC} 证书文件: ${cert_file}"
+    echo -e "  ${GREEN}✓${NC} 私钥文件: ${key_file}"
+
+    local cert_size=$(stat -c%s "$cert_file" 2>/dev/null || echo "?")
+    local key_size=$(stat -c%s "$key_file" 2>/dev/null || echo "?")
+    local cert_time=$(stat -c%y "$cert_file" 2>/dev/null | cut -d. -f1 || echo "?")
+    echo -e "  证书大小: ${cert_size} bytes"
+    echo -e "  部署时间: ${cert_time}"
+    echo ""
+
+    if command -v openssl &> /dev/null; then
+        echo "[证书详细信息]"
+        local subject=$(openssl x509 -in "$cert_file" -noout -subject 2>/dev/null | sed 's/subject=//')
+        local issuer=$(openssl x509 -in "$cert_file" -noout -issuer 2>/dev/null | sed 's/issuer=//')
+        local start_date=$(openssl x509 -in "$cert_file" -noout -startdate 2>/dev/null | sed 's/notBefore=//')
+        local end_date=$(openssl x509 -in "$cert_file" -noout -enddate 2>/dev/null | sed 's/notAfter=//')
+        local sans=$(openssl x509 -in "$cert_file" -noout -text 2>/dev/null | grep -A1 "Subject Alternative Name" | tail -1 | sed 's/DNS://g; s/,//g; s/^\s*//')
+        local serial=$(openssl x509 -in "$cert_file" -noout -serial 2>/dev/null | sed 's/serial=//')
+
+        echo -e "  主体:   ${subject}"
+        echo -e "  颁发者: ${issuer}"
+        echo -e "  域名:   ${sans}"
+        echo -e "  序列号: ${serial}"
+        echo -e "  生效:   ${start_date}"
+
+        # 计算剩余天数
+        local expiry_epoch=$(date -d "$end_date" +%s 2>/dev/null || echo "0")
+        local now_epoch=$(date +%s)
+        local days_left=$(( (expiry_epoch - now_epoch) / 86400 ))
+        if [ "$days_left" -lt 0 ]; then
+            echo -e "  到期:   ${RED}${end_date} (已过期!)${NC}"
+        elif [ "$days_left" -lt 30 ]; then
+            echo -e "  到期:   ${YELLOW}${end_date} (仅剩${days_left}天!)${NC}"
+        else
+            echo -e "  到期:   ${GREEN}${end_date} (${days_left}天)${NC}"
+        fi
+
+        # 验证证书链
+        echo ""
+        echo "[证书链验证]"
+        local chain_count=$(openssl crl2pkcs7 -nocrl -certfile "$cert_file" 2>/dev/null | openssl pkcs7 -print_certs -noout 2>/dev/null | grep -c "subject=")
+        echo -e "  证书链长度: ${chain_count:-未知} 个证书"
+
+        # 验证私钥匹配
+        local cert_md5=$(openssl x509 -in "$cert_file" -noout -modulus 2>/dev/null | openssl md5 2>/dev/null)
+        local key_md5=$(openssl rsa -in "$key_file" -noout -modulus 2>/dev/null | openssl md5 2>/dev/null)
+        if [ -n "$cert_md5" ] && [ -n "$key_md5" ]; then
+            if [ "$cert_md5" = "$key_md5" ]; then
+                echo -e "  证书/私钥: ${GREEN}✓ 匹配${NC}"
+            else
+                echo -e "  证书/私钥: ${RED}✗ 不匹配!${NC}"
+            fi
+        fi
+    else
+        echo -e "  ${YELLOW}提示: 安装 openssl 可查看详细证书信息${NC}"
+    fi
+
+    echo ""
+}
+
+# 手动指定证书路径部署
+manual_deploy_cert() {
+    echo ""
+    echo "=========================================="
+    echo "  手动指定证书路径"
+    echo "=========================================="
+    echo ""
+
+    echo "请提供证书和私钥文件的完整路径"
+    echo ""
+
+    read -p "证书文件路径 (fullchain.pem): " manual_cert
+    if [ -z "$manual_cert" ] || [ ! -f "$manual_cert" ]; then
+        log_error "证书文件不存在: $manual_cert"
+        return 1
+    fi
+
+    read -p "私钥文件路径 (privkey.pem): " manual_key
+    if [ -z "$manual_key" ] || [ ! -f "$manual_key" ]; then
+        log_error "私钥文件不存在: $manual_key"
+        return 1
+    fi
+
+    deploy_cert_to_ota "$manual_cert" "$manual_key" "手动指定"
+
+    if [ $? -eq 0 ]; then
+        echo ""
+        echo -e "${YELLOW}提示: 证书已部署，需要重启容器生效${NC}"
+        read -p "是否立即重启容器? [Y/n]: " restart_confirm
+        if [[ ! "$restart_confirm" =~ ^[Nn]$ ]]; then
+            docker restart ${CONTAINER_NAME} > /dev/null 2>&1
+            sleep 3
+            log_success "容器已重启，新证书生效"
+        fi
+    fi
+}
+
+# 搜索所有面板的证书（不限域名）
+search_all_certs() {
+    echo ""
+    echo "=========================================="
+    echo "  全局SSL证书搜索"
+    echo "=========================================="
+    echo ""
+    log_info "搜索系统中所有SSL证书..."
+    echo ""
+
+    local search_dirs=(
+        "/www/server/panel/vhost/cert"
+        "/www/server/panel/vhost/ssl"
+        "/etc/letsencrypt/live"
+        "/root/.acme.sh"
+        "/opt/1panel"
+        "/etc/nginx/ssl"
+        "/etc/nginx/conf.d/ssl"
+        "/etc/apache2/ssl"
+        "/etc/httpd/ssl"
+        "/usr/local/appnode/nginx/conf/ssl"
+        "/var/lib/caddy"
+    )
+
+    local total_found=0
+    ALL_SEARCH_RESULTS=()
+
+    for search_dir in "${search_dirs[@]}"; do
+        if [ -d "$search_dir" ]; then
+            local certs=$(find "$search_dir" -name "fullchain.pem" -o -name "fullchain.cer" -o -name "cert.pem" 2>/dev/null)
+            if [ -n "$certs" ]; then
+                echo -e "  ${GREEN}📂${NC} ${search_dir}/"
+                while IFS= read -r cert_file; do
+                    local cert_dir=$(dirname "$cert_file")
+                    local domain_guess=$(basename "$cert_dir")
+
+                    # 查找配对私钥
+                    local key_file=""
+                    for kn in "privkey.pem" "private.key" "${domain_guess}.key"; do
+                        if [ -f "${cert_dir}/${kn}" ]; then
+                            key_file="${cert_dir}/${kn}"
+                            break
+                        fi
+                    done
+
+                    if [ -n "$key_file" ]; then
+                        total_found=$((total_found + 1))
+                        ALL_SEARCH_RESULTS+=("${domain_guess}|${cert_file}|${key_file}")
+
+                        local cert_info=""
+                        if command -v openssl &> /dev/null; then
+                            local cn=$(openssl x509 -in "$cert_file" -noout -subject 2>/dev/null | sed 's/.*CN\s*=\s*//' | cut -d'/' -f1)
+                            local expiry=$(openssl x509 -in "$cert_file" -noout -enddate 2>/dev/null | sed 's/notAfter=//')
+                            cert_info=" (CN=${cn}, 到期: ${expiry})"
+                        fi
+
+                        echo -e "    ${GREEN}✓${NC} [${total_found}] ${domain_guess}${cert_info}"
+                        echo -e "        证书: ${cert_file}"
+                        echo -e "        私钥: ${key_file}"
+                    fi
+                done <<< "$certs"
+                echo ""
+            fi
+        fi
+    done
+
+    if [ $total_found -eq 0 ]; then
+        echo -e "  ${RED}✗${NC} 未在系统中找到任何SSL证书"
+        echo ""
+        echo "  建议:"
+        echo "  1. 在面板(宝塔/1Panel等)中为域名申请SSL证书"
+        echo "  2. 使用 certbot/acme.sh 命令行工具申请"
+        echo "  3. 手动上传证书文件"
+        echo ""
+        return 1
+    fi
+
+    echo ""
+    log_success "共找到 ${total_found} 个证书"
+    echo ""
+
+    echo "操作:"
+    echo "  输入编号 [1-${total_found}] 部署指定证书到 OTA-QL"
+    echo "  输入 0 返回"
+    echo ""
+    read -p "请选择: " deploy_choice
+
+    if [ "$deploy_choice" = "0" ] || [ -z "$deploy_choice" ]; then
+        return 0
+    fi
+
+    if [ "$deploy_choice" -ge 1 ] 2>/dev/null && [ "$deploy_choice" -le $total_found ] 2>/dev/null; then
+        local selected="${ALL_SEARCH_RESULTS[$((deploy_choice-1))]}"
+        local sel_domain=$(echo "$selected" | cut -d'|' -f1)
+        local sel_cert=$(echo "$selected" | cut -d'|' -f2)
+        local sel_key=$(echo "$selected" | cut -d'|' -f3)
+
+        deploy_cert_to_ota "$sel_cert" "$sel_key" "全局搜索 (${sel_domain})"
+
+        if [ $? -eq 0 ]; then
+            echo ""
+            echo -e "${YELLOW}提示: 证书已部署，需要重启容器生效${NC}"
+            read -p "是否立即重启容器? [Y/n]: " restart_confirm
+            if [[ ! "$restart_confirm" =~ ^[Nn]$ ]]; then
+                docker restart ${CONTAINER_NAME} > /dev/null 2>&1
+                sleep 3
+                log_success "容器已重启，新证书生效"
+            fi
+        fi
+    else
+        log_warning "无效选择"
+    fi
+}
+
+# 获取证书申请指导
+show_cert_guide() {
+    echo ""
+    echo "=========================================="
+    echo "  SSL证书申请指南"
+    echo "=========================================="
+    echo ""
+
+    local cb_addr=$(get_callback_addr)
+    local domain_hint=""
+    if [ -n "$cb_addr" ] && ! echo "$cb_addr" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+        domain_hint="$cb_addr"
+    fi
+
+    echo -e "${BOLD}为什么需要SSL证书？${NC}"
+    echo "  ESP32设备通过 cmux网关(${GW_PORT}) 和 MQTTS(${MQTTS_PORT}) 直连Docker容器"
+    echo "  这些连接不经过Nginx反向代理，Go服务器需要自己的CA签名证书"
+    echo "  ESP32使用 esp-x509-crt-bundle (Mozilla CA) 验证证书"
+    echo "  自签名证书会导致: Failed to verify certificate"
+    echo ""
+
+    echo -e "${BOLD}方案1: 宝塔面板（推荐）${NC}"
+    echo "  1. 登录宝塔面板"
+    echo "  2. 网站 → 选择站点 → SSL → Let's Encrypt → 申请"
+    if [ -n "$domain_hint" ]; then
+        echo "  3. 证书路径: /www/server/panel/vhost/cert/${domain_hint}/"
+        echo "  4. 部署命令:"
+        echo -e "     ${CYAN}cp /www/server/panel/vhost/cert/${domain_hint}/fullchain.pem ${CERTS_DIR}/${NC}"
+        echo -e "     ${CYAN}cp /www/server/panel/vhost/cert/${domain_hint}/privkey.pem ${CERTS_DIR}/${NC}"
+    else
+        echo "  3. 证书路径: /www/server/panel/vhost/cert/<域名>/"
+    fi
+    echo ""
+
+    echo -e "${BOLD}方案2: 1Panel 面板${NC}"
+    echo "  1. 登录1Panel面板"
+    echo "  2. 网站 → 证书 → 申请证书"
+    if [ -n "$domain_hint" ]; then
+        echo "  3. 使用菜单中的 [搜索并部署] 自动查找"
+    fi
+    echo ""
+
+    echo -e "${BOLD}方案3: Certbot 命令行${NC}"
+    if [ -n "$domain_hint" ]; then
+        echo -e "  ${CYAN}sudo certbot certonly --standalone -d ${domain_hint}${NC}"
+        echo "  或使用DNS验证（推荐，不占用80端口）:"
+        echo -e "  ${CYAN}sudo certbot certonly --manual --preferred-challenges dns -d ${domain_hint}${NC}"
+    else
+        echo -e "  ${CYAN}sudo certbot certonly --standalone -d <域名>${NC}"
+    fi
+    echo ""
+
+    echo -e "${BOLD}方案4: acme.sh 命令行${NC}"
+    if [ -n "$domain_hint" ]; then
+        echo -e "  ${CYAN}curl https://get.acme.sh | sh${NC}"
+        echo -e "  ${CYAN}~/.acme.sh/acme.sh --issue -d ${domain_hint} --standalone${NC}"
+    else
+        echo -e "  ${CYAN}curl https://get.acme.sh | sh${NC}"
+        echo -e "  ${CYAN}~/.acme.sh/acme.sh --issue -d <域名> --standalone${NC}"
+    fi
+    echo ""
+
+    echo -e "${BOLD}方案5: 手动上传${NC}"
+    echo "  将证书文件复制到以下位置:"
+    echo -e "  ${CYAN}${CERTS_DIR}/fullchain.pem${NC}  ← 证书（含中间证书链）"
+    echo -e "  ${CYAN}${CERTS_DIR}/privkey.pem${NC}    ← 私钥"
+    echo "  然后重启容器:"
+    echo -e "  ${CYAN}docker restart ${CONTAINER_NAME}${NC}"
+    echo ""
+
+    echo -e "${BOLD}多域名证书${NC}"
+    echo "  如果有多个域名，申请时添加多个 -d 参数:"
+    echo -e "  ${CYAN}sudo certbot certonly --standalone -d domain1.com -d domain2.com${NC}"
+    echo "  一个证书可以覆盖多个域名（SAN证书）"
+    echo ""
+}
+
+# 证书管理子菜单
+menu_cert_management() {
+    echo ""
+    echo "=========================================="
+    echo "  SSL 证书管理"
+    echo "=========================================="
+    echo ""
+
+    echo "  1. 查看当前证书状态"
+    echo "  2. 按域名搜索并部署证书"
+    echo "  3. 全局搜索系统中所有证书"
+    echo "  4. 手动指定证书路径"
+    echo "  5. SSL证书申请指南"
+    echo "  0. 返回主菜单"
+    echo ""
+    read -p "请选择 [0-5]: " cert_choice
+
+    case $cert_choice in
+        1)
+            show_deployed_cert_info
+            ;;
+        2)
+            local domains=$(get_domains_for_cert)
+            if [ -z "$domains" ]; then
+                read -p "请输入域名 (多个用空格分隔): " domains
+            fi
+            if [ -n "$domains" ]; then
+                for domain in $domains; do
+                    search_certs_for_domain "$domain"
+                done
+
+                if [ ${#FOUND_CERTS[@]} -gt 0 ]; then
+                    echo ""
+                    echo "选择要部署的证书:"
+                    local idx=0
+                    for entry in "${FOUND_CERTS[@]}"; do
+                        idx=$((idx + 1))
+                        local pname=$(echo "$entry" | cut -d'|' -f1)
+                        local cpath=$(echo "$entry" | cut -d'|' -f2)
+                        echo "  [${idx}] ${pname} — ${cpath}"
+                    done
+                    echo "  [0] 取消"
+                    echo ""
+                    read -p "请选择 [0-${idx}]: " sel
+
+                    if [ "$sel" -ge 1 ] 2>/dev/null && [ "$sel" -le $idx ] 2>/dev/null; then
+                        local chosen="${FOUND_CERTS[$((sel-1))]}"
+                        local ch_panel=$(echo "$chosen" | cut -d'|' -f1)
+                        local ch_cert=$(echo "$chosen" | cut -d'|' -f2)
+                        local ch_key=$(echo "$chosen" | cut -d'|' -f3)
+
+                        deploy_cert_to_ota "$ch_cert" "$ch_key" "$ch_panel"
+
+                        if [ $? -eq 0 ]; then
+                            echo ""
+                            read -p "是否立即重启容器生效? [Y/n]: " restart_confirm
+                            if [[ ! "$restart_confirm" =~ ^[Nn]$ ]]; then
+                                docker restart ${CONTAINER_NAME} > /dev/null 2>&1
+                                sleep 3
+                                log_success "容器已重启，新证书生效"
+                            fi
+                        fi
+                    fi
+                fi
+            else
+                log_warning "未输入域名"
+            fi
+            ;;
+        3)
+            search_all_certs
+            ;;
+        4)
+            manual_deploy_cert
+            ;;
+        5)
+            show_cert_guide
+            ;;
+        0)
+            return 0
+            ;;
+        *)
+            log_warning "无效选择"
+            ;;
+    esac
+}
+
 get_public_ip() {
     local PUBLIC_IP=""
     PUBLIC_IP=$(curl -4 -s --connect-timeout 5 ifconfig.me 2>/dev/null || \
@@ -749,6 +1524,9 @@ deploy_container() {
     if [ -n "${SAVED_ADDR}" ]; then
         SERVER_ADDR="${SAVED_ADDR}"
     fi
+
+    # v5.0: 自动检测并部署SSL证书（从宝塔/1Panel/Certbot等面板路径搜索）
+    auto_detect_and_deploy_certs
 
     if ! check_port_conflicts; then
         return 1
@@ -832,7 +1610,13 @@ show_production_deploy_success() {
     echo -e "  ${GREEN}✓${NC} cmux网关/MQTT/MQTTS 绑定 0.0.0.0 (设备必须直连)"
     echo -e "  ${GREEN}✓${NC} HTTPS管理+固件 绑定 127.0.0.1 (仅反代可访问)"
     echo -e "  ${GREEN}✓${NC} 建议通过 Nginx/Caddy 反向代理 Web 管理和固件下载"
-    echo -e "  ${GREEN}✓${NC} 内置自签名证书，生产环境推荐 Let's Encrypt"
+
+    # 显示TLS证书状态
+    if [ -f "${CERTS_DIR}/fullchain.pem" ] && [ -f "${CERTS_DIR}/privkey.pem" ]; then
+        echo -e "  ${GREEN}✓${NC} TLS证书已部署（CA签名，ESP32设备可验证）"
+    else
+        echo -e "  ${YELLOW}!${NC} 使用自签名证书，建议菜单 [11] 配置CA证书"
+    fi
     echo ""
 }
 
@@ -1471,7 +2255,7 @@ interactive_menu() {
     while true; do
         echo ""
         echo "=========================================="
-        echo "  OTA-QL 管理工具 (v4.6)"
+        echo "  OTA-QL 管理工具 (v5.0)"
         echo "=========================================="
         echo ""
         echo -e "  ${GREEN}1.${NC}  一键部署 ${GREEN}(生产环境-安全)${NC}"
@@ -1484,10 +2268,11 @@ interactive_menu() {
         echo "  8.  备份管理"
         echo "  9.  查看日志"
         echo -e "  ${CYAN}10.${NC} 设备回调地址设置与查看"
-        echo "  11. 退出"
-        echo -e "  ${RED}12.${NC} 一键部署 ${RED}(仅测试-不安全)${NC}"
+        echo -e "  ${CYAN}11.${NC} SSL证书管理"
+        echo "  12. 退出"
+        echo -e "  ${RED}13.${NC} 一键部署 ${RED}(仅测试-不安全)${NC}"
         echo ""
-        read -p "请选择操作 [1-12]: " choice
+        read -p "请选择操作 [1-13]: " choice
 
         case $choice in
             1)
@@ -1539,12 +2324,16 @@ interactive_menu() {
                 read -p "按Enter键返回菜单..." dummy
                 ;;
             11)
+                menu_cert_management
+                read -p "按Enter键返回菜单..." dummy
+                ;;
+            12)
                 echo ""
                 log_info "退出管理工具"
                 echo ""
                 exit 0
                 ;;
-            12)
+            13)
                 echo ""
                 echo -e "${BG_RED}${BOLD}  ⚠️ 警告：测试环境部署  ${NC}"
                 echo ""
@@ -1555,7 +2344,7 @@ interactive_menu() {
                 read -p "按Enter键返回菜单..." dummy
                 ;;
             *)
-                log_warning "无效选择，请输入 1-12"
+                log_warning "无效选择，请输入 1-13"
                 sleep 1
                 ;;
         esac
@@ -1570,7 +2359,7 @@ main() {
     echo ""
     echo "=========================================="
     echo "  OTA-QL Docker 部署管理工具"
-    echo "  版本: v4.6 | 清澜雷达 OTA 升级系统"
+    echo "  版本: v5.0 | 清澜雷达 OTA 升级系统"
     echo "  服务: HTTPS/HTTP_FW/GW/MQTT/MQTTS (5端口)"
     echo "=========================================="
     echo ""
