@@ -5,7 +5,7 @@
 # 文件名: ota-ql-docker-deploy.sh
 # 用途: 首次部署、滚动更新、备份恢复、密码重置、存储卷检查、日志管理、SSL证书管理
 # 作者: WiseFido Technologies
-# 版本: v5.3
+# 版本: v8.9
 # 更新: 2026-03-08
 #
 # 一键部署（推荐）:
@@ -46,6 +46,7 @@ CERTS_DIR="${DATA_DIR}/certs"
 LOGS_DIR="${DATA_DIR}/logs"
 DEPLOY_MODE_FILE="${DATA_DIR}/.deploy_mode"
 CALLBACK_ADDR_FILE="${DATA_DIR}/.callback_addr"
+FIRMWARE_DOMAIN_FILE="${DATA_DIR}/.firmware_domain"
 BACKUP_BASE_DIR="/backup/ota-ql"
 BACKUP_LIST_FILE="${BACKUP_BASE_DIR}/.backup_list"
 
@@ -298,22 +299,34 @@ start_new_container() {
     log_info "启动新容器..."
 
     if [ "$MODE" = "test" ]; then
-        log_info "端口绑定模式: 0.0.0.0 (全部暴露)"
+        log_info "端口绑定模式: 0.0.0.0 (全部暴露), HTTP固件=127.0.0.1(走Nginx反代)"
         local HTTPS_BIND="0.0.0.0"
+        local HTTP_FW_BIND="127.0.0.1"  # v8.9: 固件下载统一走Nginx反代
         local GW_BIND="0.0.0.0"
         local MQTT_BIND="0.0.0.0"
         local MQTTS_BIND="0.0.0.0"
     else
-        log_info "端口绑定模式: 混合 (GW/MQTT/MQTTS=0.0.0.0, HTTPS管理=127.0.0.1)"
-        local HTTPS_BIND="127.0.0.1"  # Web管理/API/固件走反代
-        local GW_BIND="0.0.0.0"       # cmux设备网关，设备直连必须暴露
-        local MQTT_BIND="0.0.0.0"     # MQTT设备直连，必须暴露
-        local MQTTS_BIND="0.0.0.0"    # MQTTS设备直连，必须暴露
+        log_info "端口绑定模式: 混合 (GW/MQTT/MQTTS=0.0.0.0, HTTPS管理+HTTP固件=127.0.0.1)"
+        local HTTPS_BIND="127.0.0.1"   # Web管理/API走反代
+        local HTTP_FW_BIND="127.0.0.1" # v8.9: 固件下载走Nginx反代
+        local GW_BIND="0.0.0.0"        # cmux设备网关，设备直连必须暴露
+        local MQTT_BIND="0.0.0.0"      # MQTT设备直连，必须暴露
+        local MQTTS_BIND="0.0.0.0"     # MQTTS设备直连，必须暴露
     fi
 
     local ENV_ARGS=""
     if [ -n "${SERVER_ADDR}" ]; then
         ENV_ARGS="-e OTA_SERVER_ADDR=${SERVER_ADDR}"
+    fi
+
+    # v8.9: 固件下载域名 → OTA_FIRMWARE_URL_BASE 环境变量
+    local FW_DOMAIN=$(get_firmware_domain)
+    if [ -n "${FW_DOMAIN}" ]; then
+        ENV_ARGS="${ENV_ARGS} -e OTA_FIRMWARE_URL_BASE=https://${FW_DOMAIN}/firmware"
+        log_success "固件下载URL: https://${FW_DOMAIN}/firmware (走Nginx HTTPS反代)"
+    else
+        log_warning "未配置固件下载域名，设备将使用 http://<回调地址>:${HTTP_FW_PORT}/firmware"
+        log_warning "建议通过菜单 [14] 设置固件下载域名，通过Nginx反代提升下载稳定性"
     fi
 
     # v5.0: 自动检测并加载TLS证书（解决ESP32 esp-x509-crt-bundle验证自签名证书失败）
@@ -622,7 +635,12 @@ show_callback_addr() {
         echo "  ────────────────────────────────────"
         echo "  MQTT Broker:  ${CB_ADDR}:${MQTTS_PORT} (MQTTS/TLS)"
         echo "  MQTT明文:     ${CB_ADDR}:${MQTT_PORT} (MQTT)"
-        echo "  固件下载:     http://${CB_ADDR}:${HTTP_FW_PORT}/firmware"
+        local FW_DOMAIN_SHOW=$(get_firmware_domain)
+        if [ -n "${FW_DOMAIN_SHOW}" ]; then
+            echo -e "  固件下载:     ${GREEN}https://${FW_DOMAIN_SHOW}/firmware${NC} (Nginx反代)"
+        else
+            echo -e "  固件下载:     ${YELLOW}未配置固件域名${NC} (请菜单14设置)"
+        fi
         echo ""
         echo "  存储位置: ${CALLBACK_ADDR_FILE}"
         echo "  环境变量: OTA_SERVER_ADDR=${CB_ADDR}"
@@ -702,6 +720,186 @@ menu_set_callback_addr() {
             ;;
         2)
             show_callback_addr
+            ;;
+        0)
+            return 0
+            ;;
+        *)
+            log_warning "无效选择"
+            ;;
+    esac
+}
+
+# ============================================================================
+# 固件下载域名管理（v8.9 新增）
+# ============================================================================
+
+# 读取已保存的固件下载域名
+get_firmware_domain() {
+    if [ -f "${FIRMWARE_DOMAIN_FILE}" ]; then
+        cat "${FIRMWARE_DOMAIN_FILE}" | tr -d '\n\r'
+    else
+        echo ""
+    fi
+}
+
+# 保存固件下载域名
+save_firmware_domain() {
+    echo "$1" > "${FIRMWARE_DOMAIN_FILE}"
+}
+
+# 交互式输入固件下载域名（部署时和菜单中复用）
+prompt_firmware_domain() {
+    local CURRENT_DOMAIN=$(get_firmware_domain)
+
+    echo ""
+    echo "========================================="
+    echo "  固件下载域名设置"
+    echo "========================================="
+    echo ""
+    echo "什么是固件下载域名？"
+    echo "  ESP32设备OTA升级时，需要通过HTTP下载固件文件。"
+    echo "  默认使用 http://<回调地址>:${HTTP_FW_PORT}/firmware 直连Docker端口，"
+    echo "  但公网下载大固件(1-2MB)时容易超时失败。"
+    echo ""
+    echo "  设置固件下载域名后，下载URL变为:"
+    echo "    https://<固件下载域名>/firmware/xxx.bin"
+    echo "  固件下载通过Nginx HTTPS反向代理，更稳定可靠。"
+    echo ""
+    echo -e "  ${YELLOW}⚠️  设置此域名前，请先在Nginx/宝塔面板中添加反向代理:${NC}"
+    echo ""
+    echo "  ┌──────────┬───────────────────────────────────┬──────────┐"
+    echo "  │ 代理目录 │ 目标                              │ 说明     │"
+    echo "  ├──────────┼───────────────────────────────────┼──────────┤"
+    echo "  │ /firmware│ http://127.0.0.1:${HTTP_FW_PORT}/firmware   │ 固件下载 │"
+    echo "  └──────────┴───────────────────────────────────┴──────────┘"
+    echo ""
+    echo -e "  推荐填写: ${GREEN}ota.wisefido.work${NC}（你的主域名）"
+    echo ""
+
+    if [ -n "${CURRENT_DOMAIN}" ]; then
+        log_info "当前固件下载域名: ${CURRENT_DOMAIN}"
+        log_info "固件下载URL: https://${CURRENT_DOMAIN}/firmware"
+        read -p "输入新域名 (回车保留当前值): " NEW_DOMAIN
+        if [ -z "${NEW_DOMAIN}" ]; then
+            NEW_DOMAIN="${CURRENT_DOMAIN}"
+            log_info "保留当前域名: ${NEW_DOMAIN}"
+        fi
+    else
+        log_warning "尚未配置固件下载域名"
+        echo -e "  推荐填写: ${GREEN}ota.wisefido.work${NC}"
+        read -p "请输入固件下载域名: " NEW_DOMAIN
+        if [ -z "${NEW_DOMAIN}" ]; then
+            log_warning "未输入域名，设备将使用HTTP直连下载固件（大文件可能超时）"
+            return 0
+        fi
+    fi
+
+    save_firmware_domain "${NEW_DOMAIN}"
+    log_success "固件下载域名已设置: ${NEW_DOMAIN}"
+    log_success "固件下载URL: https://${NEW_DOMAIN}/firmware"
+    return 0
+}
+
+# 查看固件下载域名详情
+show_firmware_domain() {
+    local FW_DOMAIN=$(get_firmware_domain)
+    echo ""
+    echo "========================================="
+    echo "  固件下载域名查看"
+    echo "========================================="
+    echo ""
+
+    if [ -n "${FW_DOMAIN}" ]; then
+        echo -e "  ${GREEN}✓${NC} 固件下载域名:  ${FW_DOMAIN}"
+        echo -e "  ${GREEN}✓${NC} 固件下载URL:   https://${FW_DOMAIN}/firmware"
+        echo ""
+        echo "  存储位置: ${FIRMWARE_DOMAIN_FILE}"
+        echo "  环境变量: OTA_FIRMWARE_URL_BASE=https://${FW_DOMAIN}/firmware"
+        echo ""
+        echo "  Nginx反向代理配置（必须已添加）:"
+        echo "  ┌──────────┬───────────────────────────────────┬──────────┐"
+        echo "  │ 代理目录 │ 目标                              │ 说明     │"
+        echo "  ├──────────┼───────────────────────────────────┼──────────┤"
+        echo "  │ /firmware│ http://127.0.0.1:${HTTP_FW_PORT}/firmware   │ 固件下载 │"
+        echo "  └──────────┴───────────────────────────────────┴──────────┘"
+    else
+        log_warning "尚未配置固件下载域名"
+        echo ""
+        echo "  设备将使用默认方式下载固件:"
+        echo -e "  ${YELLOW}http://<回调地址>:${HTTP_FW_PORT}/firmware${NC} (HTTP直连Docker端口)"
+        echo ""
+        echo -e "  ${RED}⚠️ 公网下载大固件(1-2MB)时容易超时失败${NC}"
+        echo "  建议通过菜单 14 → 1 设置固件下载域名"
+    fi
+    echo ""
+}
+
+# 设置固件下载域名（含重启Docker选项）
+set_firmware_domain_with_restart() {
+    prompt_firmware_domain
+
+    local NEW_DOMAIN=$(get_firmware_domain)
+    if [ -z "${NEW_DOMAIN}" ]; then
+        return 0
+    fi
+
+    # 检查容器是否在运行，提示重启
+    if docker ps --filter "name=${CONTAINER_NAME}" --filter "status=running" | grep -q "${CONTAINER_NAME}"; then
+        echo ""
+        log_warning "固件下载域名是容器启动时的环境变量，修改后需要重启容器才能生效"
+        read -p "是否立即重启容器？[Y/n]: " RESTART
+        if [[ ! "$RESTART" =~ ^[Nn]$ ]]; then
+            log_info "正在重启容器..."
+            docker stop ${CONTAINER_NAME} > /dev/null 2>&1
+            docker rm ${CONTAINER_NAME} > /dev/null 2>&1
+
+            # 读取当前部署模式重新启动
+            local CURRENT_MODE=$(get_deploy_mode)
+            if [ "${CURRENT_MODE}" = "unknown" ]; then
+                CURRENT_MODE="production"
+            fi
+            # 同步回调地址
+            local SAVED_ADDR=$(get_callback_addr)
+            if [ -n "${SAVED_ADDR}" ]; then
+                SERVER_ADDR="${SAVED_ADDR}"
+            fi
+            start_new_container "${CURRENT_MODE}"
+            sleep 3
+
+            if docker ps --filter "name=${CONTAINER_NAME}" --filter "status=running" | grep -q "${CONTAINER_NAME}"; then
+                log_success "容器已重启，固件下载域名已生效: ${NEW_DOMAIN}"
+                log_success "固件下载URL: https://${NEW_DOMAIN}/firmware"
+            else
+                log_error "容器重启失败，请检查日志: docker logs --tail 50 ${CONTAINER_NAME}"
+            fi
+        else
+            log_warning "容器未重启，新域名将在下次部署时生效"
+        fi
+    else
+        log_info "容器未运行，新域名将在下次部署时生效"
+    fi
+}
+
+# 菜单: 固件下载域名设置与查看（含子菜单）
+menu_firmware_domain() {
+    echo ""
+    echo "========================================="
+    echo "  固件下载域名设置与查看"
+    echo "========================================="
+    echo ""
+    echo "  1. 设置/修改固件下载域名"
+    echo "  2. 查看当前固件下载域名"
+    echo "  0. 返回主菜单"
+    echo ""
+    read -p "请选择 [0-2]: " sub_choice
+
+    case $sub_choice in
+        1)
+            set_firmware_domain_with_restart
+            ;;
+        2)
+            show_firmware_domain
             ;;
         0)
             return 0
@@ -2473,6 +2671,9 @@ deploy_container() {
         SERVER_ADDR="${SAVED_ADDR}"
     fi
 
+    # v8.9: 交互式设置固件下载域名（OTA_FIRMWARE_URL_BASE）
+    prompt_firmware_domain
+
     # v5.3: SSL证书配置（交互式菜单，含覆盖检查+SAN/通配符申请）
     deploy_cert_interactive_menu
 
@@ -2536,9 +2737,21 @@ show_production_deploy_success() {
     if [ -n "$CB_ADDR" ]; then
         echo -e "  ${GREEN}✓${NC} 回调地址:   ${CB_ADDR}"
         echo "  MQTT地址:    ${CB_ADDR}:${MQTTS_PORT} (MQTTS/TLS)"
-        echo "  固件下载:    http://${CB_ADDR}:${HTTP_FW_PORT}/firmware"
     else
         echo -e "  ${YELLOW}!${NC} 未配置，使用服务器自动检测IP"
+    fi
+    echo ""
+
+    local FW_DOMAIN_PROD=$(get_firmware_domain)
+    echo "[固件下载域名]"
+    if [ -n "$FW_DOMAIN_PROD" ]; then
+        echo -e "  ${GREEN}✓${NC} 固件域名:   ${FW_DOMAIN_PROD}"
+        echo -e "  ${GREEN}✓${NC} 固件URL:    https://${FW_DOMAIN_PROD}/firmware"
+        echo "  环境变量:    OTA_FIRMWARE_URL_BASE=https://${FW_DOMAIN_PROD}/firmware"
+        echo "  Nginx反代:   /firmware → 127.0.0.1:${HTTP_FW_PORT}"
+    else
+        echo -e "  ${YELLOW}!${NC} 未配置固件下载域名"
+        echo "  ESP32将无法通过HTTPS下载固件，请菜单 14 设置"
     fi
     echo ""
 
@@ -2581,8 +2794,9 @@ show_production_deploy_success() {
 
     echo -e "${BG_GREEN}${BOLD}  安全说明  ${NC}"
     echo -e "  ${GREEN}✓${NC} cmux网关/MQTT/MQTTS 绑定 0.0.0.0 (设备必须直连)"
-    echo -e "  ${GREEN}✓${NC} HTTPS管理+固件 绑定 127.0.0.1 (仅反代可访问)"
-    echo -e "  ${GREEN}✓${NC} 建议通过 Nginx/Caddy 反向代理 Web 管理和固件下载"
+    echo -e "  ${GREEN}✓${NC} HTTPS管理 绑定 127.0.0.1 (仅反代可访问)"
+    echo -e "  ${GREEN}✓${NC} HTTP固件 绑定 127.0.0.1 (仅Nginx反代可访问)"
+    echo -e "  ${GREEN}✓${NC} 固件下载通过 Nginx /firmware 反向代理提供 HTTPS 访问"
 
     # 显示TLS证书状态
     if [ -f "${CERTS_DIR}/fullchain.pem" ] && [ -f "${CERTS_DIR}/privkey.pem" ]; then
@@ -2619,9 +2833,18 @@ show_test_deploy_success() {
     if [ -n "$CB_ADDR" ]; then
         echo -e "  ${GREEN}✓${NC} 回调地址:   ${CB_ADDR}"
         echo "  MQTT地址:    ${CB_ADDR}:${MQTTS_PORT} (MQTTS/TLS)"
-        echo "  固件下载:    http://${CB_ADDR}:${HTTP_FW_PORT}/firmware"
     else
         echo -e "  ${YELLOW}!${NC} 未配置，使用服务器自动检测IP"
+    fi
+    echo ""
+
+    local FW_DOMAIN_TEST=$(get_firmware_domain)
+    echo "[固件下载域名]"
+    if [ -n "$FW_DOMAIN_TEST" ]; then
+        echo -e "  ${GREEN}✓${NC} 固件域名:   ${FW_DOMAIN_TEST}"
+        echo -e "  ${GREEN}✓${NC} 固件URL:    https://${FW_DOMAIN_TEST}/firmware"
+    else
+        echo -e "  ${YELLOW}!${NC} 未配置固件下载域名，请菜单 14 设置"
     fi
     echo ""
 
@@ -3216,9 +3439,20 @@ show_deployment_info() {
     if [ -n "$CB_ADDR" ]; then
         echo -e "  ${GREEN}✓${NC} 回调地址:   ${CB_ADDR}"
         echo "  MQTT地址:    ${CB_ADDR}:${MQTTS_PORT} (MQTTS/TLS)"
-        echo "  固件下载:    http://${CB_ADDR}:${HTTP_FW_PORT}/firmware"
     else
         echo -e "  ${YELLOW}!${NC} 未配置，使用服务器自动检测IP"
+    fi
+    echo ""
+
+    local FW_DOMAIN_INFO=$(get_firmware_domain)
+    echo "[固件下载域名]"
+    if [ -n "$FW_DOMAIN_INFO" ]; then
+        echo -e "  ${GREEN}✓${NC} 固件域名:   ${FW_DOMAIN_INFO}"
+        echo -e "  ${GREEN}✓${NC} 固件URL:    https://${FW_DOMAIN_INFO}/firmware"
+        echo "  环境变量:    OTA_FIRMWARE_URL_BASE=https://${FW_DOMAIN_INFO}/firmware"
+        echo "  Nginx反代:   /firmware → 127.0.0.1:${HTTP_FW_PORT}"
+    else
+        echo -e "  ${YELLOW}!${NC} 未配置固件下载域名，请菜单 14 设置"
     fi
     echo ""
 
@@ -3253,7 +3487,7 @@ interactive_menu() {
     while true; do
         echo ""
         echo "=========================================="
-        echo "  OTA-QL 管理工具 (v5.3)"
+        echo "  OTA-QL 管理工具 (v8.9)"
         echo "=========================================="
         echo ""
         echo -e "  ${GREEN}1.${NC}  一键部署 ${GREEN}(生产环境-安全)${NC}"
@@ -3267,10 +3501,11 @@ interactive_menu() {
         echo "  9.  查看日志"
         echo -e "  ${CYAN}10.${NC} 设备回调地址设置与查看"
         echo -e "  ${CYAN}11.${NC} SSL证书管理"
+        echo -e "  ${CYAN}14.${NC} 固件下载域名设置与查看"
         echo "  12. 退出"
         echo -e "  ${RED}13.${NC} 一键部署 ${RED}(仅测试-不安全)${NC}"
         echo ""
-        read -p "请选择操作 [1-13]: " choice
+        read -p "请选择操作 [1-14]: " choice
 
         case $choice in
             1)
@@ -3341,8 +3576,12 @@ interactive_menu() {
                 deploy_container "test"
                 read -p "按Enter键返回菜单..." dummy
                 ;;
+            14)
+                menu_firmware_domain
+                read -p "按Enter键返回菜单..." dummy
+                ;;
             *)
-                log_warning "无效选择，请输入 1-13"
+                log_warning "无效选择，请输入 1-14"
                 sleep 1
                 ;;
         esac
@@ -3357,7 +3596,7 @@ main() {
     echo ""
     echo "=========================================="
     echo "  OTA-QL Docker 部署管理工具"
-    echo "  版本: v5.3 | 清澜雷达 OTA 升级系统"
+    echo "  版本: v8.9 | 清澜雷达 OTA 升级系统"
     echo "  服务: HTTPS/HTTP_FW/GW/MQTT/MQTTS (5端口)"
     echo "=========================================="
     echo ""
