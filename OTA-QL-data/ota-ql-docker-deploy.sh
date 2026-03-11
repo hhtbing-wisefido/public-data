@@ -45,7 +45,7 @@ APP_DATA_DIR="${DATA_DIR}/data"
 CERTS_DIR="${DATA_DIR}/certs"
 LOGS_DIR="${DATA_DIR}/logs"
 DEPLOY_MODE_FILE="${DATA_DIR}/.deploy_mode"
-CALLBACK_ADDR_FILE="${DATA_DIR}/.callback_addr"
+MQTT_ADDR_FILE="${DATA_DIR}/.mqtt_addr"
 FIRMWARE_DOMAIN_FILE="${DATA_DIR}/.firmware_domain"
 BACKUP_BASE_DIR="/backup/ota-ql"
 BACKUP_LIST_FILE="${BACKUP_BASE_DIR}/.backup_list"
@@ -57,8 +57,8 @@ GW_PORT="10086"          # cmux设备网关（TCP+TLS自动识别）
 MQTT_PORT="1883"         # MQTT Broker（明文）
 MQTTS_PORT="8883"        # MQTT Broker（TLS加密）
 
-# 环境变量覆盖（OTA_SERVER_ADDR 优先级最高，其次是下面的默认值，留空则自动检测本机IP）
-SERVER_ADDR="${OTA_SERVER_ADDR:-}"
+# 环境变量覆盖（OTA_MQTT_ADDR 优先级最高，兼容旧名OTA_SERVER_ADDR，留空则自动检测本机IP）
+SERVER_ADDR="${OTA_MQTT_ADDR:-${OTA_SERVER_ADDR:-}}"
 LOG_LEVEL="${OTA_LOG_LEVEL:-info}"
 
 # ============================================================================
@@ -316,7 +316,7 @@ start_new_container() {
 
     local ENV_ARGS=""
     if [ -n "${SERVER_ADDR}" ]; then
-        ENV_ARGS="-e OTA_SERVER_ADDR=${SERVER_ADDR}"
+        ENV_ARGS="-e OTA_MQTT_ADDR=${SERVER_ADDR}"
     fi
 
     # v8.9+v11.1: 固件下载域名 → 双协议环境变量（TCP设备走HTTP, MQTT设备走HTTPS）
@@ -327,7 +327,7 @@ start_new_container() {
         log_success "固件下载URL(MQTT设备): https://${FW_DOMAIN}/firmware (Nginx HTTPS反代)"
         log_success "固件下载URL(TCP设备):  http://${FW_DOMAIN}/firmware (Nginx HTTP反代)"
     else
-        log_warning "未配置固件下载域名，设备将使用 http://<回调地址>:${HTTP_FW_PORT}/firmware"
+        log_warning "未配置固件下载域名，设备将使用 http://<MQTT服务器地址>:${HTTP_FW_PORT}/firmware"
         log_warning "建议通过菜单 [14] 设置固件下载域名，通过Nginx反代提升下载稳定性"
     fi
 
@@ -560,39 +560,50 @@ save_deploy_mode() {
 }
 
 # ============================================================================
-# 设备回调地址管理
+# MQTT服务器地址管理
 # ============================================================================
 
-# 读取已保存的设备回调地址
-get_callback_addr() {
-    if [ -f "${CALLBACK_ADDR_FILE}" ]; then
-        cat "${CALLBACK_ADDR_FILE}" | tr -d '\n\r'
+# 读取已保存的MQTT服务器地址
+# v13.2: 新文件 .mqtt_addr，向后兼容旧文件 .callback_addr
+get_mqtt_addr() {
+    if [ -f "${MQTT_ADDR_FILE}" ]; then
+        cat "${MQTT_ADDR_FILE}" | tr -d '\n\r'
+    elif [ -f "${DATA_DIR}/.callback_addr" ]; then
+        # 向后兼容：读取旧文件并迁移到新文件名
+        local old_addr=$(cat "${DATA_DIR}/.callback_addr" | tr -d '\n\r')
+        if [ -n "$old_addr" ]; then
+            echo "$old_addr" > "${MQTT_ADDR_FILE}"
+        fi
+        echo "$old_addr"
     else
         echo ""
     fi
 }
 
-# 保存设备回调地址
-save_callback_addr() {
-    echo "$1" > "${CALLBACK_ADDR_FILE}"
+# 保存MQTT服务器地址
+save_mqtt_addr() {
+    echo "$1" > "${MQTT_ADDR_FILE}"
 }
 
-# 交互式输入设备回调地址（部署时和菜单中复用）
-prompt_callback_addr() {
-    local CURRENT_ADDR=$(get_callback_addr)
+# 交互式输入MQTT服务器地址（部署时和菜单中复用）
+prompt_mqtt_addr() {
+    local CURRENT_ADDR=$(get_mqtt_addr)
 
     echo ""
     echo "========================================="
-    echo "  设备回调地址设置/修改"
+    echo "  MQTT服务器地址设置/修改"
     echo "========================================="
     echo ""
-    echo "什么是设备回调地址？"
+    echo "什么是MQTT服务器地址？"
     echo "  设备通过网关(:${GW_PORT})连接服务器并认证后，"
-    echo "  服务器会返回此地址告诉设备："
-    echo "    1. MQTT Broker 连接到哪里 (此地址:${MQTTS_PORT})"
-    echo "    2. OTA 固件从哪里下载 (http://此地址:${HTTP_FW_PORT}/firmware)"
+    echo "  服务器会返回此地址告诉设备MQTT Broker连接到哪里："
+    echo "    MQTT Broker地址 = 此地址:${MQTTS_PORT} (MQTTS/TLS)"
+    echo "                   = 此地址:${MQTT_PORT} (MQTT明文)"
     echo ""
-    echo "  简单理解：设备认证后\"回拨\"到这个地址获取服务"
+    echo "  简单理解：设备认证后连接到此地址的MQTT Broker"
+    echo ""
+    echo -e "  ${YELLOW}注意: 固件下载地址由菜单[14]的固件下载域名单独控制${NC}"
+    echo -e "  ${YELLOW}      MQTT服务器地址只管MQTT连接，不管固件下载${NC}"
     echo ""
     echo "地址格式：域名(推荐) 或 IP 均可"
     echo "  域名示例: ota.wisefido.com"
@@ -600,38 +611,38 @@ prompt_callback_addr() {
     echo ""
 
     if [ -n "${CURRENT_ADDR}" ]; then
-        log_info "当前设备回调地址: ${CURRENT_ADDR}"
+        log_info "当前MQTT服务器地址: ${CURRENT_ADDR}"
         read -p "输入新地址 (回车保留当前值): " NEW_ADDR
         if [ -z "${NEW_ADDR}" ]; then
             NEW_ADDR="${CURRENT_ADDR}"
             log_info "保留当前地址: ${NEW_ADDR}"
         fi
     else
-        log_warning "尚未配置设备回调地址"
-        read -p "请输入设备回调地址 (域名或IP): " NEW_ADDR
+        log_warning "尚未配置MQTT服务器地址"
+        read -p "请输入MQTT服务器地址 (域名或IP): " NEW_ADDR
         if [ -z "${NEW_ADDR}" ]; then
             log_warning "未输入地址，将使用服务器自动检测IP"
             return 0
         fi
     fi
 
-    save_callback_addr "${NEW_ADDR}"
+    save_mqtt_addr "${NEW_ADDR}"
     SERVER_ADDR="${NEW_ADDR}"
-    log_success "设备回调地址已设置: ${NEW_ADDR}"
+    log_success "MQTT服务器地址已设置: ${NEW_ADDR}"
     return 0
 }
 
-# 查看设备回调地址详情
-show_callback_addr() {
-    local CB_ADDR=$(get_callback_addr)
+# 查看MQTT服务器地址详情
+show_mqtt_addr() {
+    local CB_ADDR=$(get_mqtt_addr)
     echo ""
     echo "========================================="
-    echo "  设备回调地址查看"
+    echo "  MQTT服务器地址查看"
     echo "========================================="
     echo ""
 
     if [ -n "${CB_ADDR}" ]; then
-        echo -e "  ${GREEN}✓${NC} 回调地址:   ${CB_ADDR}"
+        echo -e "  ${GREEN}✓${NC} MQTT服务器地址:   ${CB_ADDR}"
         echo ""
         echo "  派生服务地址:"
         echo "  ────────────────────────────────────"
@@ -644,12 +655,12 @@ show_callback_addr() {
             echo -e "  固件下载:     ${YELLOW}未配置固件域名${NC} (请菜单14设置)"
         fi
         echo ""
-        echo "  存储位置: ${CALLBACK_ADDR_FILE}"
-        echo "  环境变量: OTA_SERVER_ADDR=${CB_ADDR}"
+        echo "  存储位置: ${MQTT_ADDR_FILE}"
+        echo "  环境变量: OTA_MQTT_ADDR=${CB_ADDR}"
     else
-        log_warning "尚未配置设备回调地址"
+        log_warning "尚未配置MQTT服务器地址"
         echo ""
-        echo "  服务器将使用自动检测的公网IP作为回调地址"
+        echo "  服务器将使用自动检测的公网IP作为MQTT服务器地址"
         local AUTO_IP=$(get_public_ip)
         if [ -n "${AUTO_IP}" ]; then
             echo -e "  自动检测IP: ${YELLOW}${AUTO_IP}${NC}"
@@ -662,11 +673,11 @@ show_callback_addr() {
     echo ""
 }
 
-# 设置设备回调地址（含重启Docker选项）
-set_callback_addr_with_restart() {
-    prompt_callback_addr
+# 设置MQTT服务器地址（含重启Docker选项）
+set_mqtt_addr_with_restart() {
+    prompt_mqtt_addr
 
-    local NEW_ADDR=$(get_callback_addr)
+    local NEW_ADDR=$(get_mqtt_addr)
     if [ -z "${NEW_ADDR}" ]; then
         return 0
     fi
@@ -674,7 +685,7 @@ set_callback_addr_with_restart() {
     # 检查容器是否在运行，提示重启
     if docker ps --filter "name=${CONTAINER_NAME}" --filter "status=running" | grep -q "${CONTAINER_NAME}"; then
         echo ""
-        log_warning "设备回调地址是容器启动时的环境变量，修改后需要重启容器才能生效"
+        log_warning "MQTT服务器地址是容器启动时的环境变量，修改后需要重启容器才能生效"
         read -p "是否立即重启容器？[Y/n]: " RESTART
         if [[ ! "$RESTART" =~ ^[Nn]$ ]]; then
             log_info "正在重启容器..."
@@ -691,7 +702,7 @@ set_callback_addr_with_restart() {
             sleep 3
 
             if docker ps --filter "name=${CONTAINER_NAME}" --filter "status=running" | grep -q "${CONTAINER_NAME}"; then
-                log_success "容器已重启，新的设备回调地址已生效: ${NEW_ADDR}"
+                log_success "容器已重启，新的MQTT服务器地址已生效: ${NEW_ADDR}"
             else
                 log_error "容器重启失败，请检查日志: docker logs --tail 50 ${CONTAINER_NAME}"
             fi
@@ -703,25 +714,25 @@ set_callback_addr_with_restart() {
     fi
 }
 
-# 菜单: 设备回调地址设置与查看（含子菜单）
-menu_set_callback_addr() {
+# 菜单: MQTT服务器地址设置与查看（含子菜单）
+menu_set_mqtt_addr() {
     echo ""
     echo "========================================="
-    echo "  设备回调地址设置与查看"
+    echo "  MQTT服务器地址设置与查看"
     echo "========================================="
     echo ""
-    echo "  1. 设置/修改设备回调地址"
-    echo "  2. 查看当前设备回调地址"
+    echo "  1. 设置/修改MQTT服务器地址"
+    echo "  2. 查看当前MQTT服务器地址"
     echo "  0. 返回主菜单"
     echo ""
     read -p "请选择 [0-2]: " sub_choice
 
     case $sub_choice in
         1)
-            set_callback_addr_with_restart
+            set_mqtt_addr_with_restart
             ;;
         2)
-            show_callback_addr
+            show_mqtt_addr
             ;;
         0)
             return 0
@@ -761,7 +772,7 @@ prompt_firmware_domain() {
     echo ""
     echo "什么是固件下载域名？"
     echo "  ESP32设备OTA升级时，需要通过HTTP下载固件文件。"
-    echo "  默认使用 http://<回调地址>:${HTTP_FW_PORT}/firmware 直连Docker端口，"
+    echo "  默认使用 http://<MQTT服务器地址>:${HTTP_FW_PORT}/firmware 直连Docker端口，"
     echo "  但公网下载大固件(1-2MB)时容易超时失败。"
     echo ""
     echo "  设置固件下载域名后，下载URL变为:"
@@ -831,7 +842,7 @@ show_firmware_domain() {
         log_warning "尚未配置固件下载域名"
         echo ""
         echo "  设备将使用默认方式下载固件:"
-        echo -e "  ${YELLOW}http://<回调地址>:${HTTP_FW_PORT}/firmware${NC} (HTTP直连Docker端口)"
+        echo -e "  ${YELLOW}http://<MQTT服务器地址>:${HTTP_FW_PORT}/firmware${NC} (HTTP直连Docker端口)"
         echo ""
         echo -e "  ${RED}⚠️ 公网下载大固件(1-2MB)时容易超时失败${NC}"
         echo "  建议通过菜单 14 → 1 设置固件下载域名"
@@ -863,8 +874,8 @@ set_firmware_domain_with_restart() {
             if [ "${CURRENT_MODE}" = "unknown" ]; then
                 CURRENT_MODE="production"
             fi
-            # 同步回调地址
-            local SAVED_ADDR=$(get_callback_addr)
+            # 同步MQTT服务器地址
+            local SAVED_ADDR=$(get_mqtt_addr)
             if [ -n "${SAVED_ADDR}" ]; then
                 SERVER_ADDR="${SAVED_ADDR}"
             fi
@@ -918,13 +929,13 @@ menu_firmware_domain() {
 # SSL 证书自动搜索与管理（v5.0 新增）
 # ============================================================================
 
-# 从回调地址或用户输入提取域名列表
+# 从MQTT服务器地址或用户输入提取域名列表
 # 返回: 空格分隔的域名列表（排除IP地址）
 get_domains_for_cert() {
     local domains=()
 
-    # 优先从回调地址文件读取
-    local cb_addr=$(get_callback_addr)
+    # 优先从MQTT服务器地址文件读取
+    local cb_addr=$(get_mqtt_addr)
     if [ -n "$cb_addr" ]; then
         # 排除纯IP地址，只取域名
         if ! echo "$cb_addr" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
@@ -1152,7 +1163,7 @@ deploy_cert_to_ota() {
 
 # 部署时自动搜索并安装证书
 # 在 deploy_container() 中调用
-# 参数: 无（自动从回调地址提取域名）
+# 参数: 无（自动从MQTT服务器地址提取域名）
 auto_detect_and_deploy_certs() {
     echo ""
     echo "=========================================="
@@ -1185,7 +1196,7 @@ auto_detect_and_deploy_certs() {
     # 提取域名
     local domains=$(get_domains_for_cert)
     if [ -z "$domains" ]; then
-        log_warning "未检测到域名（回调地址为IP或未设置）"
+        log_warning "未检测到域名（MQTT服务器地址为IP或未设置）"
         echo ""
         echo "  SSL证书需要域名才能搜索"
         echo "  如需手动配置，请使用菜单中的 [证书管理] 功能"
@@ -1554,7 +1565,7 @@ show_cert_guide() {
     echo "=========================================="
     echo ""
 
-    local cb_addr=$(get_callback_addr)
+    local cb_addr=$(get_mqtt_addr)
     local domain_hint=""
     if [ -n "$cb_addr" ] && ! echo "$cb_addr" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
         domain_hint="$cb_addr"
@@ -1764,8 +1775,8 @@ deploy_cert_cross_domain() {
     echo "[步骤3] 域名覆盖分析"
     echo ""
 
-    # 获取当前回调域名
-    local cb_addr=$(get_callback_addr)
+    # 获取当前MQTT域名
+    local cb_addr=$(get_mqtt_addr)
     local cb_domain=""
     if [ -n "$cb_addr" ] && ! echo "$cb_addr" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
         cb_domain="$cb_addr"
@@ -1782,7 +1793,7 @@ deploy_cert_cross_domain() {
                 covered_domains+=("$san_entry")
                 local match_icon="  "
                 if [ -n "$cb_domain" ]; then
-                    # 检查是否匹配回调域名（支持通配符匹配）
+                    # 检查是否匹配MQTT域名（支持通配符匹配）
                     if [ "$san_entry" = "$cb_domain" ]; then
                         match_icon="${GREEN}✓${NC}"
                     elif echo "$san_entry" | grep -q '^\*\.'; then
@@ -1799,7 +1810,7 @@ deploy_cert_cross_domain() {
     echo ""
 
     if [ -n "$cb_domain" ]; then
-        echo -e "  当前回调域名: ${CYAN}${cb_domain}${NC}"
+        echo -e "  当前MQTT域名: ${CYAN}${cb_domain}${NC}"
         # 检查是否被覆盖
         local is_covered=false
         for cd in "${covered_domains[@]}"; do
@@ -1816,13 +1827,13 @@ deploy_cert_cross_domain() {
             fi
         done
         if [ "$is_covered" = "true" ]; then
-            echo -e "  覆盖状态: ${GREEN}✓ 回调域名已被证书覆盖${NC}"
+            echo -e "  覆盖状态: ${GREEN}✓ MQTT域名已被证书覆盖${NC}"
         else
-            echo -e "  覆盖状态: ${YELLOW}⚠ 回调域名未在证书SAN中${NC}"
+            echo -e "  覆盖状态: ${YELLOW}⚠ MQTT域名未在证书SAN中${NC}"
             echo -e "  ${YELLOW}  ESP32设备可能因域名不匹配而拒绝连接${NC}"
         fi
     else
-        echo -e "  ${YELLOW}未设置回调域名（或为IP），跳过覆盖检查${NC}"
+        echo -e "  ${YELLOW}未设置MQTT域名（或为IP），跳过覆盖检查${NC}"
     fi
     echo ""
 
@@ -1888,7 +1899,7 @@ menu_cert_management() {
     echo "  4. 手动指定证书路径"
     echo "  5. SSL证书申请指南"
     echo "  6. 跨域名证书部署（单证书覆盖多域名）"
-    echo "  7. 查询证书覆盖情况（回调/网关/Web面板）"
+    echo "  7. 查询证书覆盖情况（MQTT/网关/Web面板）"
     echo "  8. 交互式申请 SAN 多域名证书"
     echo "  9. 交互式申请通配符证书"
     echo "  0. 返回主菜单"
@@ -1994,7 +2005,7 @@ get_public_ip() {
 # ============================================================================
 
 # v5.3: 查询当前证书对各服务地址的覆盖情况
-# 检查证书SAN是否覆盖: 设备回调地址、设备认证网关地址、Web面板地址
+# 检查证书SAN是否覆盖: MQTT服务器地址、设备认证网关地址、Web面板地址
 check_cert_coverage() {
     echo ""
     echo "=========================================="
@@ -2051,16 +2062,16 @@ check_cert_coverage() {
     echo ""
 
     # --- 3. 定义需要检查的服务地址 ---
-    local cb_addr=$(get_callback_addr)
-    local gw_addr=""   # 设备认证网关地址（与回调地址相同，用:10086端口）
+    local cb_addr=$(get_mqtt_addr)
+    local gw_addr=""   # 设备认证网关地址（与MQTT服务器地址相同，用:10086端口）
     local web_addr=""  # Web面板地址
 
     # 设备认证网关地址 = 设备NVS中存储的server地址 → 连接 :10086
-    # 通常与回调地址相同，但设备也可以用其他域名连接网关
+    # 通常与MQTT服务器地址相同，但设备也可以用其他域名连接网关
     gw_addr="$cb_addr"
 
     # Web面板地址（如果Nginx反代了443，则可能是域名:443→127.0.0.1:10088）
-    # 这里检查回调域名是否被覆盖即可，因为Web面板通常走Nginx的证书
+    # 这里检查MQTT域名是否被覆盖即可，因为Web面板通常走Nginx的证书
     web_addr="$cb_addr"
 
     echo -e "${BOLD}[服务地址覆盖检查]${NC}"
@@ -2096,7 +2107,7 @@ check_cert_coverage() {
         if [ -z "$addr" ]; then
             echo -e "  ${YELLOW}?${NC} ${label}"
             echo -e "      地址: 未配置"
-            echo -e "      状态: ${YELLOW}未设置回调地址（或为IP），无法检查${NC}"
+            echo -e "      状态: ${YELLOW}未设置MQTT服务器地址（或为IP），无法检查${NC}"
             echo ""
             return
         fi
@@ -2123,8 +2134,8 @@ check_cert_coverage() {
 
     # --- 4. 逐项检查 ---
 
-    # 4a. 设备回调地址（MQTT Broker地址: cb_addr:8883）
-    print_coverage "① 设备回调地址（MQTT Broker）" "$cb_addr" "${MQTTS_PORT}" "Go服务器 (${CERTS_DIR}/)"
+    # 4a. MQTT服务器地址（MQTT Broker地址: cb_addr:8883）
+    print_coverage "① MQTT服务器地址（MQTT Broker）" "$cb_addr" "${MQTTS_PORT}" "Go服务器 (${CERTS_DIR}/)"
 
     # 4b. 设备认证网关（cmux网关: gw_addr:10086）
     print_coverage "② 设备认证网关（cmux 网关）" "$gw_addr" "${GW_PORT}" "Go服务器 (${CERTS_DIR}/)"
@@ -2157,14 +2168,14 @@ check_cert_coverage() {
         check_domain_covered "$cb_addr"
         if [ $? -eq 0 ]; then
             total_ok=$((total_ok + 1))
-            echo -e "  ${GREEN}✓${NC} 回调域名 ${cb_addr} → 被证书覆盖"
+            echo -e "  ${GREEN}✓${NC} MQTT域名 ${cb_addr} → 被证书覆盖"
         else
             total_fail=$((total_fail + 1))
-            echo -e "  ${RED}✗${NC} 回调域名 ${cb_addr} → 未被证书覆盖"
+            echo -e "  ${RED}✗${NC} MQTT域名 ${cb_addr} → 未被证书覆盖"
         fi
     else
         total_warn=$((total_warn + 1))
-        echo -e "  ${YELLOW}⚠${NC} 回调地址为IP或未设置 → 跳过域名检查"
+        echo -e "  ${YELLOW}⚠${NC} MQTT服务器地址为IP或未设置 → 跳过域名检查"
     fi
 
     echo ""
@@ -2190,10 +2201,10 @@ apply_wildcard_cert() {
     echo "=========================================="
     echo ""
 
-    local cb_addr=$(get_callback_addr)
+    local cb_addr=$(get_mqtt_addr)
     local base_domain=""
 
-    # 从回调地址推断基础域名（如 ota.wisefido.com → wisefido.com）
+    # 从MQTT服务器地址推断基础域名（如 ota.wisefido.com → wisefido.com）
     if [ -n "$cb_addr" ] && ! echo "$cb_addr" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
         base_domain=$(echo "$cb_addr" | awk -F. '{if(NF>=2) print $(NF-1)"."$NF}')
     fi
@@ -2298,7 +2309,7 @@ apply_san_cert() {
     echo "=========================================="
     echo ""
 
-    local cb_addr=$(get_callback_addr)
+    local cb_addr=$(get_mqtt_addr)
 
     echo -e "${BOLD}SAN 多域名证书说明:${NC}"
     echo "  • 一张证书包含多个指定域名（SAN = Subject Alternative Name）"
@@ -2307,7 +2318,7 @@ apply_san_cert() {
     echo ""
 
     if [ -n "$cb_addr" ] && ! echo "$cb_addr" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
-        echo -e "  当前回调域名: ${CYAN}${cb_addr}${NC}"
+        echo -e "  当前MQTT域名: ${CYAN}${cb_addr}${NC}"
         echo ""
     fi
 
@@ -2468,7 +2479,7 @@ deploy_cert_interactive_menu() {
     echo "  1. 搜索已有证书（从宝塔/1Panel/Certbot等面板路径搜索）"
     echo "  2. 申请通配符证书（*.domain.com，覆盖所有子域名）"
     echo "  3. 申请 SAN 多域名证书（指定多个域名写入一张证书）"
-    echo "  4. 查询证书覆盖情况（检查回调地址/网关/Web面板）"
+    echo "  4. 查询证书覆盖情况（检查MQTT服务器地址/网关/Web面板）"
     echo "  5. 交互式申请 SAN 多域名证书（引导式填写域名+选验证方式）"
     echo "  6. 交互式申请通配符证书（引导式填写域名+DNS验证指引）"
     echo "  0. 跳过（使用自签名证书，ESP32设备可能无法连接）"
@@ -2561,10 +2572,10 @@ deploy_cert_interactive_menu() {
             echo ""
             echo -e "${BOLD}交互式 SAN 多域名证书申请${NC}"
             echo ""
-            # 先展示当前回调地址帮助用户决策
-            local cb_addr=$(get_callback_addr)
+            # 先展示当前MQTT服务器地址帮助用户决策
+            local cb_addr=$(get_mqtt_addr)
             if [ -n "$cb_addr" ] && ! echo "$cb_addr" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
-                echo -e "  当前回调域名: ${CYAN}${cb_addr}${NC}"
+                echo -e "  当前MQTT域名: ${CYAN}${cb_addr}${NC}"
                 echo -e "  建议至少包含此域名"
                 echo ""
             fi
@@ -2593,10 +2604,10 @@ deploy_cert_interactive_menu() {
             echo ""
             echo -e "${BOLD}交互式通配符证书申请${NC}"
             echo ""
-            local cb_addr=$(get_callback_addr)
+            local cb_addr=$(get_mqtt_addr)
             if [ -n "$cb_addr" ] && ! echo "$cb_addr" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
                 local inferred_base=$(echo "$cb_addr" | awk -F. '{if(NF>=2) print $(NF-1)"."$NF}')
-                echo -e "  当前回调域名: ${CYAN}${cb_addr}${NC}"
+                echo -e "  当前MQTT域名: ${CYAN}${cb_addr}${NC}"
                 echo -e "  推测基础域名: ${CYAN}${inferred_base}${NC}"
                 echo -e "  通配符证书 *.${inferred_base} 将覆盖所有 ${inferred_base} 的子域名"
                 echo ""
@@ -2667,10 +2678,10 @@ deploy_container() {
 
     create_data_directories
 
-    # 交互式设置设备回调地址
-    prompt_callback_addr
-    # 同步回调地址到 SERVER_ADDR（供 start_new_container 使用）
-    local SAVED_ADDR=$(get_callback_addr)
+    # 交互式设置MQTT服务器地址
+    prompt_mqtt_addr
+    # 同步MQTT服务器地址到 SERVER_ADDR（供 start_new_container 使用）
+    local SAVED_ADDR=$(get_mqtt_addr)
     if [ -n "${SAVED_ADDR}" ]; then
         SERVER_ADDR="${SAVED_ADDR}"
     fi
@@ -2736,10 +2747,10 @@ show_production_deploy_success() {
     echo "  MQTTS:      ${MQTTS_PORT}  — 0.0.0.0 (设备TLS直连)"
     echo ""
 
-    local CB_ADDR=$(get_callback_addr)
-    echo "[设备回调地址]"
+    local CB_ADDR=$(get_mqtt_addr)
+    echo "[MQTT服务器地址]"
     if [ -n "$CB_ADDR" ]; then
-        echo -e "  ${GREEN}✓${NC} 回调地址:   ${CB_ADDR}"
+        echo -e "  ${GREEN}✓${NC} MQTT服务器地址:   ${CB_ADDR}"
         echo "  MQTT地址:    ${CB_ADDR}:${MQTTS_PORT} (MQTTS/TLS)"
     else
         echo -e "  ${YELLOW}!${NC} 未配置，使用服务器自动检测IP"
@@ -2834,10 +2845,10 @@ show_test_deploy_success() {
     echo -e "  MQTTS:      ${MQTTS_PORT}  — ${RED}公网可访问${NC}"
     echo ""
 
-    local CB_ADDR=$(get_callback_addr)
-    echo "[设备回调地址]"
+    local CB_ADDR=$(get_mqtt_addr)
+    echo "[MQTT服务器地址]"
     if [ -n "$CB_ADDR" ]; then
-        echo -e "  ${GREEN}✓${NC} 回调地址:   ${CB_ADDR}"
+        echo -e "  ${GREEN}✓${NC} MQTT服务器地址:   ${CB_ADDR}"
         echo "  MQTT地址:    ${CB_ADDR}:${MQTTS_PORT} (MQTTS/TLS)"
     else
         echo -e "  ${YELLOW}!${NC} 未配置，使用服务器自动检测IP"
@@ -3440,10 +3451,10 @@ show_deployment_info() {
     docker inspect --format='{{range .Mounts}}  {{.Source}} → {{.Destination}} ({{.Type}}){{println}}{{end}}' ${CONTAINER_NAME} 2>/dev/null || log_warning "无法获取存储卷"
     echo ""
 
-    local CB_ADDR=$(get_callback_addr)
-    echo "[设备回调地址]"
+    local CB_ADDR=$(get_mqtt_addr)
+    echo "[MQTT服务器地址]"
     if [ -n "$CB_ADDR" ]; then
-        echo -e "  ${GREEN}✓${NC} 回调地址:   ${CB_ADDR}"
+        echo -e "  ${GREEN}✓${NC} MQTT服务器地址:   ${CB_ADDR}"
         echo "  MQTT地址:    ${CB_ADDR}:${MQTTS_PORT} (MQTTS/TLS)"
     else
         echo -e "  ${YELLOW}!${NC} 未配置，使用服务器自动检测IP"
@@ -3507,7 +3518,7 @@ interactive_menu() {
         echo "  7.  一键恢复数据"
         echo "  8.  备份管理"
         echo "  9.  查看日志"
-        echo -e "  ${CYAN}10.${NC} 设备回调地址设置与查看"
+        echo -e "  ${CYAN}10.${NC} MQTT服务器地址设置与查看"
         echo -e "  ${CYAN}11.${NC} SSL证书管理"
         echo -e "  ${CYAN}14.${NC} 固件下载域名设置与查看"
         echo "  12. 退出"
@@ -3561,7 +3572,7 @@ interactive_menu() {
                 read -p "按Enter键返回菜单..." dummy
                 ;;
             10)
-                menu_set_callback_addr
+                menu_set_mqtt_addr
                 read -p "按Enter键返回菜单..." dummy
                 ;;
             11)
