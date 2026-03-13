@@ -47,6 +47,7 @@ LOGS_DIR="${DATA_DIR}/logs"
 DEPLOY_MODE_FILE="${DATA_DIR}/.deploy_mode"
 MQTT_ADDR_FILE="${DATA_DIR}/.mqtt_addr"
 FIRMWARE_DOMAIN_FILE="${DATA_DIR}/.firmware_domain"
+REVERSE_PROXY_FILE="${DATA_DIR}/.reverse_proxy"
 BACKUP_BASE_DIR="/backup/ota-ql"
 BACKUP_LIST_FILE="${BACKUP_BASE_DIR}/.backup_list"
 
@@ -296,19 +297,30 @@ check_port_conflicts() {
 # 测试模式: 全部绑定 0.0.0.0
 start_new_container() {
     local MODE="${1:-production}"
+    local RP_MODE=$(get_reverse_proxy_mode)
     log_info "启动新容器..."
 
     if [ "$MODE" = "test" ]; then
-        log_info "端口绑定模式: 0.0.0.0 (全部暴露), HTTP固件=127.0.0.1(走Nginx反代)"
+        if [ "$RP_MODE" = "no" ]; then
+            log_info "端口绑定模式: 0.0.0.0 (全部暴露, 无反向代理)"
+            local HTTP_FW_BIND="0.0.0.0"
+        else
+            log_info "端口绑定模式: 0.0.0.0 (全部暴露), HTTP固件=127.0.0.1(走Nginx反代)"
+            local HTTP_FW_BIND="127.0.0.1"
+        fi
         local HTTPS_BIND="0.0.0.0"
-        local HTTP_FW_BIND="127.0.0.1"  # v8.9: 固件下载统一走Nginx反代
         local GW_BIND="0.0.0.0"
         local MQTT_BIND="0.0.0.0"
         local MQTTS_BIND="0.0.0.0"
     else
-        log_info "端口绑定模式: 混合 (GW/MQTT/MQTTS=0.0.0.0, HTTPS管理+HTTP固件=127.0.0.1)"
+        if [ "$RP_MODE" = "no" ]; then
+            log_info "端口绑定模式: 混合 (GW/MQTT/MQTTS=0.0.0.0, HTTPS=127.0.0.1, HTTP固件=0.0.0.0 无反代)"
+            local HTTP_FW_BIND="0.0.0.0"   # v9.0: 无反代时固件下载直连
+        else
+            log_info "端口绑定模式: 混合 (GW/MQTT/MQTTS=0.0.0.0, HTTPS管理+HTTP固件=127.0.0.1)"
+            local HTTP_FW_BIND="127.0.0.1" # v8.9: 固件下载走Nginx反代
+        fi
         local HTTPS_BIND="127.0.0.1"   # Web管理/API走反代
-        local HTTP_FW_BIND="127.0.0.1" # v8.9: 固件下载走Nginx反代
         local GW_BIND="0.0.0.0"        # cmux设备网关，设备直连必须暴露
         local MQTT_BIND="0.0.0.0"      # MQTT设备直连，必须暴露
         local MQTTS_BIND="0.0.0.0"     # MQTTS设备直连，必须暴露
@@ -557,6 +569,138 @@ get_deploy_mode() {
 
 save_deploy_mode() {
     echo "$1" > "${DEPLOY_MODE_FILE}"
+}
+
+# ============================================================================
+# 反向代理模式管理（v9.0 新增）
+# ============================================================================
+
+# 读取反向代理模式: "yes"(默认) 或 "no"
+get_reverse_proxy_mode() {
+    if [ -f "${REVERSE_PROXY_FILE}" ]; then
+        cat "${REVERSE_PROXY_FILE}" | tr -d '\n\r'
+    else
+        echo "yes"
+    fi
+}
+
+# 保存反向代理模式
+save_reverse_proxy_mode() {
+    echo "$1" > "${REVERSE_PROXY_FILE}"
+}
+
+# 交互式选择反向代理模式（部署时调用）
+prompt_reverse_proxy_mode() {
+    local CURRENT_MODE=$(get_reverse_proxy_mode)
+
+    echo ""
+    echo "========================================="
+    echo "  反向代理模式设置"
+    echo "========================================="
+    echo ""
+    echo "固件下载端口(${HTTP_FW_PORT})的网络访问方式:"
+    echo ""
+    echo -e "  ${GREEN}1. 使用反向代理（推荐/默认）${NC}"
+    echo "     HTTP固件端口绑定 127.0.0.1，仅 Nginx 可访问"
+    echo "     设备通过 Nginx 反代下载固件（HTTPS + 域名）"
+    echo "     适用: 已配置 Nginx/宝塔反向代理的服务器"
+    echo ""
+    echo -e "  ${YELLOW}2. 不使用反向代理${NC}"
+    echo "     HTTP固件端口绑定 0.0.0.0，设备直接访问"
+    echo "     设备通过 http://服务器IP:${HTTP_FW_PORT}/firmware 下载"
+    echo "     适用: 测试环境 / 内网 / 无Nginx的服务器"
+    echo ""
+
+    if [ "$CURRENT_MODE" = "yes" ]; then
+        echo -e "  当前模式: ${GREEN}使用反向代理${NC}"
+    else
+        echo -e "  当前模式: ${YELLOW}不使用反向代理${NC}"
+    fi
+    echo ""
+
+    read -p "是否使用反向代理? [Y/n] (默认Y): " choice
+    if [[ "$choice" =~ ^[Nn]$ ]]; then
+        save_reverse_proxy_mode "no"
+        log_info "已选择: 不使用反向代理 (HTTP固件端口将绑定 0.0.0.0)"
+    else
+        save_reverse_proxy_mode "yes"
+        log_info "已选择: 使用反向代理 (HTTP固件端口绑定 127.0.0.1)"
+    fi
+}
+
+# 自动检测并配置 Nginx Range 头透传
+auto_configure_nginx_range() {
+    local FW_DOMAIN=$(get_firmware_domain)
+    if [ -z "$FW_DOMAIN" ]; then
+        return 0
+    fi
+
+    # 搜索 Nginx 配置文件
+    local NGINX_CONF=""
+    local SEARCH_PATHS=(
+        "/www/server/panel/vhost/nginx/${FW_DOMAIN}.conf"
+        "/etc/nginx/conf.d/${FW_DOMAIN}.conf"
+        "/etc/nginx/sites-available/${FW_DOMAIN}"
+        "/etc/nginx/sites-enabled/${FW_DOMAIN}"
+        "/opt/1panel/core/apps/openresty/openresty/conf.d/${FW_DOMAIN}.conf"
+    )
+
+    for path in "${SEARCH_PATHS[@]}"; do
+        if [ -f "$path" ]; then
+            NGINX_CONF="$path"
+            break
+        fi
+    done
+
+    if [ -z "$NGINX_CONF" ]; then
+        log_info "未检测到 Nginx 配置文件，跳过 Range 头自动配置"
+        echo -e "  ${YELLOW}提示: 部署完成后可通过菜单 [15] 手动配置${NC}"
+        return 0
+    fi
+
+    log_info "检测到 Nginx 配置: $NGINX_CONF"
+
+    # 检查是否已配置 Range 头透传
+    if grep -q "proxy_set_header Range" "$NGINX_CONF"; then
+        log_success "Nginx Range 头透传已配置 ✓"
+        return 0
+    fi
+
+    # 检查 /firmware location 是否存在
+    if ! grep -q "location.*\/firmware" "$NGINX_CONF"; then
+        log_warning "Nginx 配置中未找到 /firmware location，请先在宝塔面板中配置反向代理"
+        echo -e "  ${YELLOW}提示: 部署完成后可通过菜单 [15] 配置${NC}"
+        return 0
+    fi
+
+    echo ""
+    echo -e "  ${CYAN}检测到 Nginx /firmware 反代尚未配置 Range 头透传${NC}"
+    echo "  配置 Range 头透传可实现 OTA 进度 0%→100% 实时追踪"
+    echo ""
+    read -p "  是否自动配置 Nginx Range 头透传? [Y/n]: " confirm
+    if [[ "$confirm" =~ ^[Nn]$ ]]; then
+        log_info "跳过 Range 头配置，进度将通过 Safety Net 估算"
+        return 0
+    fi
+
+    # 备份
+    local BACKUP="${NGINX_CONF}.bak.$(date +%Y%m%d%H%M%S)"
+    cp "$NGINX_CONF" "$BACKUP"
+    log_info "已备份: $BACKUP"
+
+    # 插入 Range 头配置
+    sed -i '/location.*\/firmware/a\        # OTA-QL Range头透传（实现OTA进度0%→100%实时追踪）\n        proxy_set_header Range $http_range;\n        proxy_set_header If-Range $http_if_range;\n        proxy_buffering off;\n        proxy_cache off;' "$NGINX_CONF"
+
+    # 测试语法
+    if nginx -t 2>/dev/null; then
+        nginx -s reload 2>/dev/null
+        log_success "Nginx Range 头透传已自动配置并生效 ✓"
+        log_info "OTA 进度条将实时追踪 0%→100%"
+    else
+        log_warning "Nginx 语法检测失败，正在恢复..."
+        cp "$BACKUP" "$NGINX_CONF"
+        log_info "已恢复原配置，请通过菜单 [15] 手动配置"
+    fi
 }
 
 # ============================================================================
@@ -922,6 +1066,291 @@ menu_firmware_domain() {
         *)
             log_warning "无效选择"
             ;;
+    esac
+}
+
+# ============================================================================
+# Nginx 固件下载 Range 头配置管理（v9.0 新增）
+# ============================================================================
+
+# 查找 Nginx 配置文件
+find_nginx_conf() {
+    local FW_DOMAIN=$(get_firmware_domain)
+    if [ -z "$FW_DOMAIN" ]; then
+        echo ""
+        return 1
+    fi
+
+    local SEARCH_PATHS=(
+        "/www/server/panel/vhost/nginx/${FW_DOMAIN}.conf"
+        "/etc/nginx/conf.d/${FW_DOMAIN}.conf"
+        "/etc/nginx/sites-available/${FW_DOMAIN}"
+        "/etc/nginx/sites-enabled/${FW_DOMAIN}"
+        "/opt/1panel/core/apps/openresty/openresty/conf.d/${FW_DOMAIN}.conf"
+    )
+
+    for path in "${SEARCH_PATHS[@]}"; do
+        if [ -f "$path" ]; then
+            echo "$path"
+            return 0
+        fi
+    done
+
+    echo ""
+    return 1
+}
+
+# 配置 Nginx Range 头透传
+configure_nginx_range_header() {
+    echo ""
+    echo "========================================"
+    echo "  Nginx 固件下载 Range 头配置"
+    echo "========================================"
+
+    local FW_DOMAIN=$(get_firmware_domain)
+    if [ -z "$FW_DOMAIN" ]; then
+        log_error "未配置固件下载域名，请先使用菜单 [14] 设置"
+        return 1
+    fi
+
+    local NGINX_CONF=$(find_nginx_conf)
+    if [ -z "$NGINX_CONF" ]; then
+        log_warning "未自动找到 Nginx 配置文件"
+        read -p "请手动输入 Nginx 配置文件路径: " NGINX_CONF
+        if [ ! -f "$NGINX_CONF" ]; then
+            log_error "文件不存在: $NGINX_CONF"
+            return 1
+        fi
+    else
+        log_success "找到 Nginx 配置: $NGINX_CONF"
+    fi
+
+    # 检查是否已配置
+    if grep -q "proxy_set_header Range" "$NGINX_CONF"; then
+        log_success "✅ 已配置 Range 头透传"
+        echo ""
+        echo "当前 /firmware 配置:"
+        sed -n '/location.*\/firmware/,/}/p' "$NGINX_CONF" | head -20
+        return 0
+    fi
+
+    # 检查 /firmware location
+    if ! grep -q "location.*\/firmware" "$NGINX_CONF"; then
+        log_error "未找到 /firmware location 块，请先在宝塔面板中配置反向代理"
+        return 1
+    fi
+
+    echo ""
+    echo "当前状态: ⚠️ 未配置 Range 头透传"
+    echo "将在 /firmware location 块中添加以下配置:"
+    echo ""
+    echo "    proxy_set_header Range \$http_range;"
+    echo "    proxy_set_header If-Range \$http_if_range;"
+    echo "    proxy_buffering off;"
+    echo "    proxy_cache off;"
+    echo ""
+
+    read -p "确认修改？(修改前会自动备份) [y/N]: " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        log_info "已取消"
+        return 0
+    fi
+
+    # 备份
+    local BACKUP="${NGINX_CONF}.bak.$(date +%Y%m%d%H%M%S)"
+    cp "$NGINX_CONF" "$BACKUP"
+    log_info "已备份: $BACKUP"
+
+    # 插入配置
+    sed -i '/location.*\/firmware/a\        # OTA-QL Range头透传（实现OTA进度0%→100%实时追踪）\n        proxy_set_header Range $http_range;\n        proxy_set_header If-Range $http_if_range;\n        proxy_buffering off;\n        proxy_cache off;' "$NGINX_CONF"
+
+    if nginx -t 2>/dev/null; then
+        nginx -s reload 2>/dev/null
+        log_success "✅ Nginx Range 头透传已配置并生效"
+        log_info "OTA 进度条现在可以实时追踪 0%→100%"
+    else
+        log_error "Nginx 语法检查失败，正在恢复..."
+        cp "$BACKUP" "$NGINX_CONF"
+        log_info "已恢复原配置"
+        return 1
+    fi
+
+    echo ""
+    echo "验证方法:"
+    echo "  1. 推送一次OTA到设备"
+    echo "  2. 检查日志: docker logs --tail 50 ${CONTAINER_NAME} 2>&1 | grep '固件Range下载'"
+}
+
+# 查看 Nginx /firmware 配置
+show_nginx_firmware_config() {
+    local NGINX_CONF=$(find_nginx_conf)
+    if [ -z "$NGINX_CONF" ]; then
+        log_warning "未找到 Nginx 配置文件"
+        local FW_DOMAIN=$(get_firmware_domain)
+        if [ -z "$FW_DOMAIN" ]; then
+            log_error "未配置固件下载域名，请先使用菜单 [14] 设置"
+        fi
+        return 1
+    fi
+
+    echo ""
+    echo "===== Nginx 配置文件: $NGINX_CONF ====="
+    echo ""
+    echo "===== /firmware location 配置 ====="
+    sed -n '/location.*\/firmware/,/}/p' "$NGINX_CONF"
+    echo ""
+
+    if grep -q "proxy_set_header Range" "$NGINX_CONF"; then
+        echo -e "${GREEN}✅ Range 头透传: 已启用${NC}"
+        echo "   效果: Go 服务端收到 Range 头 → Write() 实时追踪 0%→100%"
+    else
+        echo -e "${YELLOW}⚠️ Range 头透传: 未启用${NC}"
+        echo "   效果: Go 只收到 1 次请求 → 进度通过 Safety Net 估算"
+    fi
+}
+
+# 移除 Range 头透传配置
+remove_nginx_range_config() {
+    local NGINX_CONF=$(find_nginx_conf)
+    if [ -z "$NGINX_CONF" ]; then
+        log_warning "未找到 Nginx 配置文件"
+        return 1
+    fi
+
+    if ! grep -q "proxy_set_header Range" "$NGINX_CONF"; then
+        log_info "当前未配置 Range 头透传，无需恢复"
+        return 0
+    fi
+
+    echo ""
+    log_warning "将移除 Nginx Range 头透传配置"
+    echo "  效果: OTA 进度将通过 Safety Net 估算（0%→100% 跳变）"
+    echo ""
+    read -p "确认移除? [y/N]: " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        log_info "已取消"
+        return 0
+    fi
+
+    local BACKUP="${NGINX_CONF}.bak.$(date +%Y%m%d%H%M%S)"
+    cp "$NGINX_CONF" "$BACKUP"
+    log_info "已备份: $BACKUP"
+
+    sed -i '/# OTA-QL Range头透传/d' "$NGINX_CONF"
+    sed -i '/proxy_set_header Range \$http_range/d' "$NGINX_CONF"
+    sed -i '/proxy_set_header If-Range \$http_if_range/d' "$NGINX_CONF"
+    sed -i '/proxy_buffering off/d' "$NGINX_CONF"
+    sed -i '/proxy_cache off/d' "$NGINX_CONF"
+
+    if nginx -t 2>/dev/null && nginx -s reload 2>/dev/null; then
+        log_success "✅ 已恢复默认配置，进度将通过 Safety Net 估算"
+    else
+        log_error "恢复失败，正在回滚..."
+        cp "$BACKUP" "$NGINX_CONF"
+        nginx -s reload 2>/dev/null
+    fi
+}
+
+# 验证 Range 头透传
+verify_range_header() {
+    local FW_DOMAIN=$(get_firmware_domain)
+    if [ -z "$FW_DOMAIN" ]; then
+        log_error "未配置固件下载域名"
+        return 1
+    fi
+
+    log_info "验证 Range 头透传..."
+    echo ""
+
+    # 直连 Go 测试
+    echo "[1] 直连 Go 服务端测试 (http://127.0.0.1:${HTTP_FW_PORT}/firmware/)"
+    local DIRECT_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+        -H "Range: bytes=0-99" "http://127.0.0.1:${HTTP_FW_PORT}/firmware/" 2>/dev/null)
+    echo "  HTTP 状态码: $DIRECT_CODE"
+
+    # 通过 Nginx 测试
+    echo "[2] 通过 Nginx 域名测试 (https://${FW_DOMAIN}/firmware/)"
+    local NGINX_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+        -H "Range: bytes=0-99" "https://${FW_DOMAIN}/firmware/" 2>/dev/null)
+    echo "  HTTP 状态码: $NGINX_CODE"
+
+    # Go 日志检查
+    echo "[3] Go 容器日志检查"
+    local GO_LOG=$(docker logs --tail 20 ${CONTAINER_NAME} 2>&1 | grep "固件Range下载" | tail -3)
+    if [ -n "$GO_LOG" ]; then
+        log_success "Go 服务端收到 Range 请求"
+        echo "  $GO_LOG"
+    else
+        log_warning "Go 日志中未检测到 Range 请求"
+        echo "  (可能 firmware 目录无文件，请推送一次OTA验证)"
+    fi
+
+    echo ""
+    echo "完整验证: 推送一次OTA到实际设备，检查 P1 进度条是否 0%→100% 平滑递增"
+}
+
+# 手动配置指南
+show_range_manual_guide() {
+    local FW_DOMAIN=$(get_firmware_domain)
+    echo ""
+    echo "========================================"
+    echo "  Nginx Range 头透传手动配置指南"
+    echo "========================================"
+    echo ""
+    echo "在 Nginx 配置文件的 /firmware location 块内添加以下 4 行:"
+    echo ""
+    echo "    # OTA-QL Range头透传（实现OTA进度0%→100%实时追踪）"
+    echo "    proxy_set_header Range \$http_range;"
+    echo "    proxy_set_header If-Range \$http_if_range;"
+    echo "    proxy_buffering off;"
+    echo "    proxy_cache off;"
+    echo ""
+
+    if [ -n "$FW_DOMAIN" ]; then
+        echo "本项目 Nginx 配置文件可能位置:"
+        echo "  宝塔面板: /www/server/panel/vhost/nginx/${FW_DOMAIN}.conf"
+        echo "  原生Nginx: /etc/nginx/conf.d/${FW_DOMAIN}.conf"
+        echo "  1Panel:   /opt/1panel/core/apps/openresty/openresty/conf.d/${FW_DOMAIN}.conf"
+    fi
+    echo ""
+    echo "修改后执行:"
+    echo "  sudo nginx -t && sudo nginx -s reload"
+}
+
+# 菜单: Nginx Range 头配置管理
+menu_nginx_range() {
+    echo ""
+    echo "========================================="
+    echo "  Nginx 固件下载 Range 头配置"
+    echo "========================================="
+
+    # 显示当前状态
+    local NGINX_CONF=$(find_nginx_conf)
+    if [ -n "$NGINX_CONF" ] && grep -q "proxy_set_header Range" "$NGINX_CONF"; then
+        echo -e "  当前状态: ${GREEN}✅ 已配置 Range 头透传${NC}"
+        echo "  效果: OTA 进度 0%→100% 实时追踪"
+    else
+        echo -e "  当前状态: ${YELLOW}⚠️ 未配置 Range 头透传${NC}"
+        echo "  效果: OTA 进度通过 Safety Net 估算"
+    fi
+    echo ""
+    echo "  1. 自动配置 Range 头透传（推荐）"
+    echo "  2. 查看当前 Nginx /firmware 配置"
+    echo "  3. 手动配置指南"
+    echo "  4. 验证 Range 头透传是否生效"
+    echo "  5. 恢复默认（移除 Range 头透传）"
+    echo "  0. 返回主菜单"
+    echo ""
+    read -p "请选择 [0-5]: " sub_choice
+
+    case $sub_choice in
+        1) configure_nginx_range_header ;;
+        2) show_nginx_firmware_config ;;
+        3) show_range_manual_guide ;;
+        4) verify_range_header ;;
+        5) remove_nginx_range_config ;;
+        0) return 0 ;;
+        *) log_warning "无效选择" ;;
     esac
 }
 
@@ -2689,6 +3118,9 @@ deploy_container() {
     # v8.9: 交互式设置固件下载域名（OTA_FIRMWARE_URL_BASE）
     prompt_firmware_domain
 
+    # v9.0: 交互式设置反向代理模式（影响HTTP固件端口绑定 + Nginx Range头自动配置）
+    prompt_reverse_proxy_mode
+
     # v5.3: SSL证书配置（交互式菜单，含覆盖检查+SAN/通配符申请）
     deploy_cert_interactive_menu
 
@@ -2705,6 +3137,12 @@ deploy_container() {
 
     start_new_container "$mode"
     save_deploy_mode "$mode"
+
+    # v9.0: 使用反向代理时，自动检测并配置 Nginx Range 头透传
+    local RP_MODE=$(get_reverse_proxy_mode)
+    if [ "$RP_MODE" = "yes" ]; then
+        auto_configure_nginx_range
+    fi
 
     if health_check; then
         cleanup_old_images
@@ -2772,6 +3210,23 @@ show_production_deploy_success() {
     fi
     echo ""
 
+    # v9.0: 显示反向代理和Range头状态
+    local RP_MODE_SHOW=$(get_reverse_proxy_mode)
+    echo "[反向代理 & OTA进度]"
+    if [ "$RP_MODE_SHOW" = "yes" ]; then
+        echo -e "  ${GREEN}✓${NC} 反向代理:   已启用 (HTTP固件端口绑定 127.0.0.1)"
+        local NGINX_CONF_SHOW=$(find_nginx_conf)
+        if [ -n "$NGINX_CONF_SHOW" ] && grep -q "proxy_set_header Range" "$NGINX_CONF_SHOW" 2>/dev/null; then
+            echo -e "  ${GREEN}✓${NC} Range头透传: 已配置 (OTA进度 0%→100% 实时追踪)"
+        else
+            echo -e "  ${YELLOW}!${NC} Range头透传: 未配置 (OTA进度通过Safety Net估算, 菜单15可配置)"
+        fi
+    else
+        echo -e "  ${YELLOW}!${NC} 反向代理:   未启用 (HTTP固件端口绑定 0.0.0.0)"
+        echo -e "  ${YELLOW}!${NC} OTA进度:    直连模式 (Range头默认透传)"
+    fi
+    echo ""
+
     echo "[访问地址]"
     echo -e "  ${GREEN}✓${NC} 管理面板:  https://localhost:${HTTPS_PORT}/"
     echo -e "  ${GREEN}✓${NC} 健康检查:  https://localhost:${HTTPS_PORT}/api/health"
@@ -2812,8 +3267,12 @@ show_production_deploy_success() {
     echo -e "${BG_GREEN}${BOLD}  安全说明  ${NC}"
     echo -e "  ${GREEN}✓${NC} cmux网关/MQTT/MQTTS 绑定 0.0.0.0 (设备必须直连)"
     echo -e "  ${GREEN}✓${NC} HTTPS管理 绑定 127.0.0.1 (仅反代可访问)"
-    echo -e "  ${GREEN}✓${NC} HTTP固件 绑定 127.0.0.1 (仅Nginx反代可访问)"
-    echo -e "  ${GREEN}✓${NC} 固件下载通过 Nginx /firmware 反向代理提供 HTTPS 访问"
+    if [ "$(get_reverse_proxy_mode)" = "yes" ]; then
+        echo -e "  ${GREEN}✓${NC} HTTP固件 绑定 127.0.0.1 (仅Nginx反代可访问)"
+        echo -e "  ${GREEN}✓${NC} 固件下载通过 Nginx /firmware 反向代理提供 HTTPS 访问"
+    else
+        echo -e "  ${YELLOW}!${NC} HTTP固件 绑定 0.0.0.0 (设备直连,未使用反向代理)"
+    fi
 
     # 显示TLS证书状态
     if [ -f "${CERTS_DIR}/fullchain.pem" ] && [ -f "${CERTS_DIR}/privkey.pem" ]; then
@@ -3506,7 +3965,7 @@ interactive_menu() {
     while true; do
         echo ""
         echo "=========================================="
-        echo "  OTA-QL 管理工具 (v8.9)"
+        echo "  OTA-QL 管理工具 (v9.0)"
         echo "=========================================="
         echo ""
         echo -e "  ${GREEN}1.${NC}  一键部署 ${GREEN}(生产环境-安全)${NC}"
@@ -3521,10 +3980,11 @@ interactive_menu() {
         echo -e "  ${CYAN}10.${NC} MQTT服务器地址设置与查看"
         echo -e "  ${CYAN}11.${NC} SSL证书管理"
         echo -e "  ${CYAN}14.${NC} 固件下载域名设置与查看"
+        echo -e "  ${CYAN}15.${NC} Nginx Range 头配置（OTA进度）"
         echo "  12. 退出"
         echo -e "  ${RED}13.${NC} 一键部署 ${RED}(仅测试-不安全)${NC}"
         echo ""
-        read -p "请选择操作 [1-14]: " choice
+        read -p "请选择操作 [1-15]: " choice
 
         case $choice in
             1)
@@ -3599,8 +4059,12 @@ interactive_menu() {
                 menu_firmware_domain
                 read -p "按Enter键返回菜单..." dummy
                 ;;
+            15)
+                menu_nginx_range
+                read -p "按Enter键返回菜单..." dummy
+                ;;
             *)
-                log_warning "无效选择，请输入 1-14"
+                log_warning "无效选择，请输入 1-15"
                 sleep 1
                 ;;
         esac
@@ -3615,7 +4079,7 @@ main() {
     echo ""
     echo "=========================================="
     echo "  OTA-QL Docker 部署管理工具"
-    echo "  版本: v8.9 | 清澜雷达 OTA 升级系统"
+    echo "  版本: v9.0 | 清澜雷达 OTA 升级系统"
     echo "  服务: HTTPS/HTTP_FW/GW/MQTT/MQTTS (5端口)"
     echo "=========================================="
     echo ""
